@@ -1573,6 +1573,11 @@ stream_write_idle_cb(pa_mainloop_api *a, pa_time_event *e,
         a->time_free(e);
     if (!s->ph)
         return;
+    // A write gap on a live stream is not a yield. Closing here dropped
+    // the PCM mid-track and the next open landed on a stale volumioswitch
+    // target. Release only after cork (want_running already 0, paused).
+    if (s->want_running && !g_atomic_int_get(&s->paused))
+        return;
     diag_logf("write idle: releasing device");
     stream_release_device(s);
 }
