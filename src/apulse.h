@@ -136,12 +136,15 @@ struct pa_stream {
     int clock_have_path;
     int clock_logged;
     char clock_status_path[576];
-    // Interpolation between period boundaries. hw_ptr advances once per period,
-    // so a client sampling faster than that sees a staircase. These record when
-    // hw_ptr last changed and by how much, so the position can be estimated
-    // between steps.
-    struct timeval clock_step_at;
-    int64_t clock_step_frames;
+    // Smoothed clock model. Real PulseAudio answers timing queries from a
+    // fitted rate and offset rather than from a fresh measurement, so two reads
+    // microseconds apart are consistent with each other by construction.
+    // Soloist polls in bursts tens of microseconds apart, where a raw hardware
+    // sample cannot be differenced meaningfully.
+    struct timeval clock_model_at;    // when the model was last anchored
+    int64_t clock_model_frames;       // hardware position at that anchor
+    double clock_model_rate;          // frames per second, fitted
+    int clock_model_valid;
     // Duration of the ALSA buffer actually opened, reported to the client as
     // configured_sink_usec so it knows what pipeline it is feeding.
     pa_usec_t configured_sink_usec;

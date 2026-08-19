@@ -500,9 +500,125 @@ stream_clock_reset(pa_stream *s)
     s->clock_have_origin = 0;
     s->clock_have_path = 0;
     s->clock_status_path[0] = '\0';
-    s->clock_step_at.tv_sec = 0;
-    s->clock_step_at.tv_usec = 0;
-    s->clock_step_frames = 0;
+    s->clock_model_at.tv_sec = 0;
+    s->clock_model_at.tv_usec = 0;
+    s->clock_model_frames = 0;
+    s->clock_model_rate = 0.0;
+    s->clock_model_valid = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Smoothed clock model.
+//
+// The raw hardware position is accurate. Measured over 30 s of lossless
+// playback, correlating the derived playback rate against the interval between
+// consecutive client reads:
+//
+//   gap between reads   share   rate outside 0.9-1.1
+//   over 20 ms           5.9%     0.0%
+//   5 to 20 ms           2.0%     0.0%
+//   1 to 5 ms            1.2%     1.0%
+//   0.2 to 1 ms          1.3%    61.0%
+//   under 0.2 ms        89.6%    84.1%
+//
+// Above a millisecond the clock is essentially exact: median 0.996 to 1.000,
+// tenth and ninetieth percentiles within a fraction of a percent. Nothing is
+// wrong with the position or the timestamp. But Soloist takes 90% of its reads
+// in bursts under 200 us apart, and at 44100 the /proc read costs 70 us, which
+// is 3 frames. Differencing two samples that close divides a 3-frame quantum by
+// a near-zero interval, so the apparent rate swings between 0.5x and 1.5x.
+// That is arithmetic, not a fault, and no amount of measurement accuracy fixes
+// it.
+//
+// Real PulseAudio does not answer with a fresh measurement each time. It keeps
+// a model of the clock and answers from that, so two reads microseconds apart
+// return values consistent with each other by construction.
+//
+// The model here is a position anchor plus a rate, re-fitted whenever the
+// hardware has advanced far enough to measure a rate reliably. Between fits the
+// answer is anchor + rate * elapsed, which is smooth at any sampling interval.
+// The rate is fitted from the hardware, not assumed from the sample rate, so a
+// device clock that runs slightly fast or slow is tracked rather than papered
+// over.
+// ---------------------------------------------------------------------------
+
+// Refit no more often than this: below it the hardware has not moved enough for
+// the measured rate to mean anything.
+#define CLOCK_MODEL_MIN_FIT_US 100000
+
+// A fitted rate this far from nominal is not a clock, it is a glitch: a period
+// boundary landing badly, or the process being descheduled mid-read. Keep the
+// previous rate rather than tracking noise.
+#define CLOCK_MODEL_MAX_DRIFT 0.05
+
+static void
+stream_clock_model_update(pa_stream *s, int64_t hw_frames,
+                          const struct timeval *now)
+{
+    long elapsed_us;
+    double measured;
+
+    if (!s->clock_model_valid) {
+        s->clock_model_at = *now;
+        s->clock_model_frames = hw_frames;
+        s->clock_model_rate = (double)s->ss.rate;
+        s->clock_model_valid = 1;
+        return;
+    }
+
+    elapsed_us = (long)(now->tv_sec - s->clock_model_at.tv_sec) * 1000000L +
+                 (now->tv_usec - s->clock_model_at.tv_usec);
+    if (elapsed_us < CLOCK_MODEL_MIN_FIT_US)
+        return;
+
+    measured = (double)(hw_frames - s->clock_model_frames) * 1000000.0 /
+               (double)elapsed_us;
+
+    if (s->ss.rate > 0) {
+        double nominal = (double)s->ss.rate;
+
+        if (measured > nominal * (1.0 - CLOCK_MODEL_MAX_DRIFT) &&
+            measured < nominal * (1.0 + CLOCK_MODEL_MAX_DRIFT)) {
+            // Ease toward the measurement rather than jumping to it, so one odd
+            // fit cannot step the reported rate.
+            s->clock_model_rate =
+                s->clock_model_rate * 0.75 + measured * 0.25;
+        }
+    }
+
+    // Re-anchor on the real position either way, so the model can never drift
+    // away from the hardware even if its rate is briefly wrong.
+    s->clock_model_at = *now;
+    s->clock_model_frames = hw_frames;
+}
+
+// Position from the model: anchor plus fitted rate times elapsed. Clamped so it
+// cannot run ahead of the hardware by more than one period, which is the
+// furthest ahead the truth could plausibly be.
+static int64_t
+stream_clock_model_frames(pa_stream *s, const struct timeval *now,
+                          int64_t hw_frames, long period)
+{
+    long elapsed_us;
+    int64_t est;
+
+    if (!s->clock_model_valid)
+        return hw_frames;
+
+    elapsed_us = (long)(now->tv_sec - s->clock_model_at.tv_sec) * 1000000L +
+                 (now->tv_usec - s->clock_model_at.tv_usec);
+    if (elapsed_us < 0)
+        elapsed_us = 0;
+
+    est = s->clock_model_frames +
+          (int64_t)(s->clock_model_rate * (double)elapsed_us / 1000000.0);
+
+    if (period > 0 && est > hw_frames + period)
+        est = hw_frames + period;
+    if (est < hw_frames)
+        est = hw_frames;
+
+    return est;
 }
 
 static void
@@ -586,66 +702,32 @@ stream_hw_time(pa_stream *s)
             (long)(read_t1.tv_sec - s->timing_info.timestamp.tv_sec) * 1000000L +
             (read_t1.tv_usec - s->timing_info.timestamp.tv_usec);
 
-        diag_logf("clockread proc_us=%ld stale_us=%ld hw_ptr=%ld step=%lld",
-                  proc_us, stale_us, snap.hw_ptr,
-                  (long long)s->clock_step_frames);
+        diag_logf("clockread proc_us=%ld stale_us=%ld hw_ptr=%ld rate=%.1f",
+                  proc_us, stale_us, snap.hw_ptr, s->clock_model_rate);
     }
 
     hw = unwrap_hw_ptr(s->clock_last_hw, snap.hw_ptr);
+    s->clock_last_hw = hw;
 
-    // Interpolate between period boundaries.
+    // Answer from the model, not from this sample.
     //
-    // hw_ptr in /proc/asound advances once per period: 883 frames, about 20 ms
-    // here. Soloist reads position every 3 to 4 ms and estimates between reads,
-    // so four reads in five see the same hw_ptr as the last one and the fifth
-    // jumps a whole period. Position is a staircase; the client expects a ramp.
+    // The previous version interpolated from the last time hw_ptr changed,
+    // which removed the staircase (zero-motion reads fell from 32% to 0.2%)
+    // but left the spread wide: 40% of reads still read 0.5x to 0.9x and 35%
+    // read 1.1x to 2.0x. Correlating those against the sampling interval showed
+    // why: every bad reading came from a burst where the client polled less
+    // than a millisecond apart, and above 1 ms the clock was already exact.
     //
-    // Measured over 31 s of lossless playback, 8102 consecutive reads:
-    //
-    //   rate 0.00 (position did not move)   32%
-    //   rate 1.1 to 2.0                     52%
-    //   rate 0.9 to 1.1                     13%
-    //   worst case                          2.7x
-    //
-    // Average 1.0, which is why the track ends on time and why a per-second
-    // summary looked healthy. Instantaneously it alternates between stopped and
-    // double speed, and a client steering from that rushes, slows and chops.
-    //
-    // timestamp made it worse: it is taken fresh on every call, so a stale
-    // position was paired with a current time.
-    //
-    // Between steps, add the elapsed time since hw_ptr last moved, capped at
-    // one period so the estimate can never overtake the hardware. When hw_ptr
-    // does move, the real value takes over and the estimate restarts.
+    // A per-read estimate cannot fix that, because the error is in dividing a
+    // small measurement quantum by a smaller interval. The model can, because
+    // it does not divide anything at read time.
     {
         struct timeval now;
 
         gettimeofday(&now, NULL);
-
-        if (hw != s->clock_last_hw || s->clock_step_at.tv_sec == 0) {
-            // Real advance. Anchor here and take the hardware value as-is.
-            s->clock_step_at = now;
-            s->clock_step_frames = 0;
-        } else if (snap.period_size > 0) {
-            int64_t elapsed_us =
-                (int64_t)(now.tv_sec - s->clock_step_at.tv_sec) * 1000000 +
-                (now.tv_usec - s->clock_step_at.tv_usec);
-            int64_t est;
-
-            if (elapsed_us < 0)
-                elapsed_us = 0;
-            est = (int64_t)((uint64_t)elapsed_us * rate / 1000000ULL);
-
-            // Never more than one period ahead: beyond that the hardware
-            // really has stalled and inventing progress would be a lie.
-            if (est > snap.period_size)
-                est = snap.period_size;
-            s->clock_step_frames = est;
-        }
+        stream_clock_model_update(s, hw, &now);
+        hw = stream_clock_model_frames(s, &now, hw, snap.period_size);
     }
-
-    hw += s->clock_step_frames;
-    s->clock_last_hw = unwrap_hw_ptr(s->clock_last_hw, snap.hw_ptr);
     if (!s->clock_have_origin) {
         s->clock_origin_hw = hw;
         s->clock_have_origin = 1;
