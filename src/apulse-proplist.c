@@ -79,7 +79,15 @@ pa_proplist_set(pa_proplist *p, const char *key, const void *data,
     if (!v)
         return -1;
 
+    // g_memdup takes a guint, but nbytes here is a size_t, so the call also
+    // narrows on 64-bit. g_memdup2 takes a gsize and is the documented
+    // replacement. Guarded because it appeared in glib 2.68 and apulse itself
+    // declares no minimum version; Debian Bookworm ships 2.74.
+#if GLIB_CHECK_VERSION(2, 68, 0)
+    v->data = g_memdup2(data, nbytes);
+#else
     v->data = g_memdup(data, nbytes);
+#endif
     v->len = nbytes;
 
     g_hash_table_insert(p->ht, strdup(key), v);
