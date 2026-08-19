@@ -1438,10 +1438,17 @@ err:
 // only ever closed in pa_stream_disconnect, so a corked stream held the device
 // indefinitely.
 //
-// The io events go first, as in pa_stream_disconnect, so the callback cannot
-// fire against a closed handle. The ring is kept: it holds audio the client
-// wrote but the DAC has not played, and that is still the right audio to send
-// when playback resumes.
+// Releasing is not just a close. Closing creates a new device instance on the
+// next open, so hw_ptr in /proc restarts at zero, while read_index is held at
+// its old value by the monotonic rule. fill = write_index - read_index then
+// collapses, writable_size (tlength - fill) goes to zero, and the client stops
+// writing: observed as a burst of the stale ring, the seek bar advancing on the
+// interpolated clock and then stalling, and no audio until a track change.
+//
+// A track change is pa_stream_flush, and that path works. So this does exactly
+// what flush does: discard the ring, zero the indices, reset the clock. The
+// device and our accounting restart together, which is the only state in which
+// they can agree.
 static void
 stream_release_device(pa_stream *s)
 {
@@ -1464,11 +1471,22 @@ stream_release_device(pa_stream *s)
     snd_pcm_drop(s->ph);
     snd_pcm_close(s->ph);
     s->ph = NULL;
+
+    // The flush contract, for the reasons above.
+    if (s->rb)
+        ringbuffer_drop(s->rb, ringbuffer_readable_size(s->rb));
+    s->timing_info.write_index = 0;
+    s->timing_info.read_index = 0;
+    s->timing_info.since_underrun = 0;
+    stream_clock_reset(s);
 }
 
 // Take the device back on uncork. do_connect_pcm renegotiates and rebuilds the
-// io events, which is the same path a new stream takes, so resuming is exactly
-// a fresh connect with the ring already primed.
+// io events, which is the same path a new stream takes.
+//
+// Output stays disabled until the client writes, again matching flush: the ring
+// is empty by definition here, so enabling POLLOUT would only spin. The flow
+// control in pa_stream_write restores it when there is something to send.
 static int
 stream_acquire_device(pa_stream *s)
 {
@@ -1480,19 +1498,8 @@ stream_acquire_device(pa_stream *s)
         return -1;
     }
 
-    // do_connect_pcm sets out_enabled = 1 itself, and
-    // stream_set_output_enabled returns early when the flag already matches, so
-    // asking it to enable here does nothing and io_enable is never called on
-    // the newly created events. The ring then has audio with nothing waking to
-    // drain it: after a pause and play the transport showed playing with no
-    // sound until a track change forced a flush and fresh writes.
-    //
-    // Clear the flag first so the enable is real.
-    s->out_enabled = 0;
-    stream_set_output_enabled(s, 1);
-
-    diag_logf("reacquired device on uncork: rb=%zu",
-              s->rb ? ringbuffer_readable_size(s->rb) : 0);
+    stream_set_output_enabled(s, 0);
+    diag_logf("reacquired device on uncork");
     return 0;
 }
 
