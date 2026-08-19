@@ -25,10 +25,169 @@
 #include "apulse.h"
 #include "trace.h"
 #include "util.h"
+#include <stdarg.h>
 
 #define MAKE_SND_LIB_VERSION(a, b, c) (((a) << 16) | ((b) << 8) | (c))
 
 #define HAVE_SND_PCM_AVAIL SND_LIB_VERSION >= MAKE_SND_LIB_VERSION(1, 0, 18)
+
+// ---------------------------------------------------------------------------
+// Diagnostics, entirely gated behind APULSE_DIAG=1. Unset means every function
+// below returns immediately and nothing is logged, so this changes no
+// behaviour.
+//
+// Exists because WITH_TRACE=0 in the shipped build and snd_pcm_recover is
+// called with silent=1, so short writes, xruns and inserted silence are all
+// invisible. Diagnosing playback faults by ear cost several wrong hypotheses.
+//
+// The lifecycle lines matter most. Soloist applies a quality change on the
+// next track, not mid-stream, so a format change should appear here as a
+// disconnect/connect pair with a different sample spec. If the pair is absent,
+// the stream was reused and s->ss is stale. If it is present but the second
+// connect negotiated different ALSA parameters, the fault is in reconnect.
+// ---------------------------------------------------------------------------
+
+static int
+diag_on(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *e = getenv("APULSE_DIAG");
+
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+static void
+diag_logf(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!diag_on())
+        return;
+    fputs("apulse diag: ", stderr);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
+static const char *
+diag_fmt_name(pa_sample_format_t f)
+{
+    const char *n = pa_sample_format_to_string(f);
+
+    return n ? n : "?";
+}
+
+// Per-second write-loop counters. Reported once a second from the io callback,
+// which is the only place they are touched, so no locking is needed.
+static struct {
+    struct timeval t0;
+    unsigned wakeups;     // io callback entries with POLLOUT
+    unsigned writes;      // snd_pcm_writei calls actually made
+    unsigned short_w;     // writes that took fewer frames than offered
+    unsigned err;         // writes that returned < 0
+    unsigned xrun;        // recover() paths taken
+    unsigned pads;        // wakeups that wrote silence
+    long frames;          // frames accepted by ALSA
+    long pad_frames;      // of which silence
+    long client_bytes;    // bytes accepted from the client
+} dstat;
+
+static void
+diag_reset(void)
+{
+    memset(&dstat, 0, sizeof(dstat));
+    gettimeofday(&dstat.t0, NULL);
+}
+
+static void
+diag_note_write(snd_pcm_sframes_t wr, size_t offered, int padded)
+{
+    if (!diag_on())
+        return;
+    dstat.writes++;
+    if (wr < 0) {
+        dstat.err++;
+        return;
+    }
+    dstat.frames += (long)wr;
+    if ((size_t)wr < offered)
+        dstat.short_w++;
+    if (padded) {
+        dstat.pads++;
+        dstat.pad_frames += (long)wr;
+    }
+}
+
+// The tripwire. Soloist decodes lossy to 16-bit and lossless to float32, so a
+// format change alters its byte rate into pa_stream_write while the frame rate
+// into ALSA stays at the sample rate. Dividing one by the other gives the frame
+// size the client is really using; if that disagrees with pa_frame_size(&s->ss)
+// then the stream is being fed a format it was not opened with, and every
+// index and latency calculation is out by that ratio.
+static void
+diag_tick(pa_stream *s)
+{
+    struct timeval now;
+    long ms;
+    size_t declared;
+    long implied_x100 = 0;
+
+    if (!diag_on())
+        return;
+
+    gettimeofday(&now, NULL);
+    if (dstat.t0.tv_sec == 0)
+        dstat.t0 = now;
+    ms = (now.tv_sec - dstat.t0.tv_sec) * 1000 +
+         (now.tv_usec - dstat.t0.tv_usec) / 1000;
+    if (ms < 1000)
+        return;
+
+    declared = pa_frame_size(&s->ss);
+    if (dstat.frames > 0)
+        implied_x100 = dstat.client_bytes * 100 / dstat.frames;
+
+    {
+        snd_pcm_sframes_t delay = 0;
+        snd_pcm_sframes_t avail = 0;
+        size_t rb = s->rb ? ringbuffer_readable_size(s->rb) : 0;
+
+        if (s->ph) {
+            if (snd_pcm_delay(s->ph, &delay) < 0)
+                delay = 0;
+            avail = snd_pcm_avail(s->ph);
+            if (avail < 0)
+                avail = 0;
+        }
+
+        diag_logf("1s wake=%u wr=%u short=%u err=%u xrun=%u pad=%u "
+                  "frames=%ld padf=%ld cbytes=%ld frame_size=%zu "
+                  "implied=%ld.%02ld delay=%ld avail=%ld rb=%zu",
+                  dstat.wakeups, dstat.writes, dstat.short_w, dstat.err,
+                  dstat.xrun, dstat.pads, dstat.frames, dstat.pad_frames,
+                  dstat.client_bytes, declared, implied_x100 / 100,
+                  implied_x100 % 100, (long)delay, (long)avail, rb);
+
+        // Only meaningful once a full second of steady playback has passed.
+        if (dstat.frames > 1000 && declared > 0 &&
+            (implied_x100 < (long)declared * 100 * 3 / 4 ||
+             implied_x100 > (long)declared * 100 * 5 / 4))
+            diag_logf("FORMAT MISMATCH: client is writing ~%ld.%02ld bytes per "
+                      "frame but the stream was opened with %zu "
+                      "(%s %u Hz %u ch). Indices and latency are wrong by that "
+                      "ratio.",
+                      implied_x100 / 100, implied_x100 % 100, declared,
+                      diag_fmt_name(s->ss.format), s->ss.rate, s->ss.channels);
+    }
+
+    diag_reset();
+}
 
 static void
 deh_stream_state_changed(pa_mainloop_api *api, pa_defer_event *de,
@@ -85,6 +244,8 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
             }
 
             int cnt = 0, ret;
+
+            dstat.xrun++;
             do {
                 cnt++;
                 ret = snd_pcm_recover(s->ph, frame_count, 1);
@@ -171,11 +332,15 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
     }
 
     if (events & PA_IO_EVENT_OUTPUT) {
+        dstat.wakeups++;
         if (paused) {
             // client stream is corked. Pass silence to ALSA
             size_t bytecnt = MIN(buf_size, frame_count * frame_size);
+            snd_pcm_sframes_t wr;
+
             memset(buf, 0, bytecnt);
-            snd_pcm_writei(s->ph, buf, bytecnt / frame_size);
+            wr = snd_pcm_writei(s->ph, buf, bytecnt / frame_size);
+            diag_note_write(wr, bytecnt / frame_size, 1);
         } else {
             size_t writable_size = pa_stream_writable_size(s);
 
@@ -189,13 +354,19 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
 
             pa_apply_volume_multiplier(buf, bytecnt, s->volume, &s->ss);
 
+            int padded = 0;
+            snd_pcm_sframes_t wr;
+
             if (bytecnt == 0) {
                 // application is not ready yet, play silence
                 bytecnt = MIN(buf_size, frame_count * frame_size);
                 memset(buf, 0, bytecnt);
+                padded = 1;
             }
-            snd_pcm_writei(s->ph, buf, bytecnt / frame_size);
+            wr = snd_pcm_writei(s->ph, buf, bytecnt / frame_size);
+            diag_note_write(wr, bytecnt / frame_size, padded);
         }
+        diag_tick(s);
     }
 
     if (events & PA_IO_EVENT_INPUT) {
@@ -449,6 +620,15 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
     }
     free(fds);
 
+    diag_logf("connect %s: spec %s %u Hz %u ch frame=%zu | alsa period=%lu "
+              "buffer=%lu | tlength=%u minreq=%u prebuf=%u",
+              direction_name, diag_fmt_name(s->ss.format), s->ss.rate,
+              s->ss.channels, pa_frame_size(&s->ss),
+              (unsigned long)period_size, (unsigned long)buffer_size,
+              s->buffer_attr.tlength, s->buffer_attr.minreq,
+              s->buffer_attr.prebuf);
+    diag_reset();
+
     s->state = PA_STREAM_READY;
     pa_stream_ref(s);
     s->c->mainloop_api->defer_new(s->c->mainloop_api, deh_stream_state_changed,
@@ -640,6 +820,7 @@ err:
 static void
 pa_stream_cork_impl(pa_operation *op)
 {
+    diag_logf("cork %d", op->int_arg_1 ? 1 : 0);
     g_atomic_int_set(&op->s->paused, !!(op->int_arg_1));
 
     if (op->stream_success_cb)
@@ -674,6 +855,24 @@ pa_stream_disconnect(pa_stream *s)
 
     if (s->state != PA_STREAM_READY)
         return PA_ERR_BADSTATE;
+
+    // Logged before the close so the state ALSA is being left in is visible.
+    // Upstream closes without dropping first, so a running stream with a full
+    // buffer is torn down mid-flight; if a reconnect then misbehaves this line
+    // and the next connect line are the pair to compare.
+    if (diag_on()) {
+        snd_pcm_sframes_t delay = 0;
+        snd_pcm_state_t st = SND_PCM_STATE_DISCONNECTED;
+
+        if (s->ph) {
+            if (snd_pcm_delay(s->ph, &delay) < 0)
+                delay = 0;
+            st = snd_pcm_state(s->ph);
+        }
+        diag_logf("disconnect: alsa state=%s delay=%ld rb=%zu",
+                  snd_pcm_state_name(st), (long)delay,
+                  s->rb ? ringbuffer_readable_size(s->rb) : 0);
+    }
 
     for (int k = 0; k < s->nioe; k++) {
         pa_mainloop_api *api = s->c->mainloop_api;
@@ -717,6 +916,11 @@ pa_stream_drain(pa_stream *s, pa_stream_success_cb_t cb, void *userdata)
 static void
 pa_stream_flush_impl(pa_operation *op)
 {
+    // Upstream discards nothing here. Logged so a skip or seek is visible in
+    // the sequence, and so it is obvious that queued audio survives it.
+    diag_logf("flush (upstream no-op): rb=%zu",
+              op->s->rb ? ringbuffer_readable_size(op->s->rb) : 0);
+
     // TODO: is it ok to do nothing?
 
     if (op->stream_success_cb)
@@ -961,6 +1165,10 @@ pa_stream_new_with_proplist(pa_context *c, const char *name,
     s->idx = c->next_stream_idx++;
     g_hash_table_insert(c->streams_ht, GINT_TO_POINTER(s->idx), s);
 
+    diag_logf("new stream idx=%u: spec %s %u Hz %u ch frame=%zu", s->idx,
+              diag_fmt_name(s->ss.format), s->ss.rate, s->ss.channels,
+              pa_frame_size(&s->ss));
+
     // fill initial values of s->timing_info
     gettimeofday(&s->timing_info.timestamp, NULL);
     s->timing_info.synchronized_clocks = 1;
@@ -1190,6 +1398,7 @@ pa_stream_write(pa_stream *s, const void *data, size_t nbytes,
 
     size_t written = ringbuffer_write(s->rb, data, nbytes);
     s->timing_info.since_underrun += written;
+    dstat.client_bytes += (long)written;
     s->timing_info.write_index += written;
 
     if (data == s->write_buffer) {
