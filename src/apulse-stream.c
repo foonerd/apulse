@@ -1552,11 +1552,37 @@ stream_acquire_device(pa_stream *s)
 }
 
 static void
+stream_request_write(pa_stream *s)
+{
+    size_t writable_size;
+
+    if (!s || s->direction != PA_STREAM_PLAYBACK || !s->write_cb)
+        return;
+    writable_size = pa_stream_writable_size(s);
+    if (writable_size > 0)
+        s->write_cb(s, writable_size, s->write_cb_userdata);
+}
+
+static void
+stream_pcm_run(pa_stream *s)
+{
+    if (!s->ph)
+        return;
+    if (snd_pcm_state(s->ph) == SND_PCM_STATE_PREPARED)
+        snd_pcm_start(s->ph);
+}
+
+static void
 stream_become_running(pa_stream *s)
 {
-    if (s->clock_have_origin || s->clock_frozen_usec)
-        stream_clock_start(s);
+    stream_clock_start(s);
     g_atomic_int_set(&s->paused, 0);
+    // Idle-close emptied the ring and skipped the first-write defer
+    // (state is already READY). Without this request the POLLOUT
+    // handler sees an empty ring, drops POLLOUT, and stays silent
+    // until the next track change writes on its own.
+    stream_request_write(s);
+    stream_pcm_run(s);
     stream_wake_output(s);
 }
 
