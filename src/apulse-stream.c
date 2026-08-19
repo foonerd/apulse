@@ -530,11 +530,14 @@ stream_hw_time(pa_stream *s)
     int64_t frames;
     pa_usec_t played;
     unsigned rate = s->ss.rate;
+    struct timeval read_t0, read_t1;
 
     if (!s->clock_running)
         return s->clock_frozen_usec;
     if (rate == 0)
         return s->clock_last_played;
+
+    gettimeofday(&read_t0, NULL);
 
     if (!s->clock_have_path) {
         if (scan_hw_pcm(rate, &snap) == 0) {
@@ -560,6 +563,32 @@ stream_hw_time(pa_stream *s)
     } else if (read_hw_pcm_snap(s->clock_status_path, &snap) < 0) {
         s->clock_have_path = 0;
         return s->clock_last_played;
+    }
+
+    // How long the position measurement itself took, and how stale
+    // timing_info.timestamp already is by the time we have a position.
+    //
+    // stream_update_timing sets timestamp with gettimeofday and then calls this,
+    // which opens, reads and parses two files under /proc. The client differences
+    // consecutive (position, timestamp) pairs to derive a rate, so any variation
+    // in that interval appears to it as the audio speeding up or slowing down.
+    //
+    // After the period interpolation landed, zero-motion reads fell from 32% to
+    // 0.2% but the spread stayed wide: 40% of reads between 0.5x and 0.9x, 35%
+    // between 1.1x and 2.0x, symmetric around 1.0. That symmetry is what a
+    // varying measurement offset looks like, so measure it before changing
+    // anything else.
+    gettimeofday(&read_t1, NULL);
+    if (diag_full()) {
+        long proc_us = (long)(read_t1.tv_sec - read_t0.tv_sec) * 1000000L +
+                       (read_t1.tv_usec - read_t0.tv_usec);
+        long stale_us =
+            (long)(read_t1.tv_sec - s->timing_info.timestamp.tv_sec) * 1000000L +
+            (read_t1.tv_usec - s->timing_info.timestamp.tv_usec);
+
+        diag_logf("clockread proc_us=%ld stale_us=%ld hw_ptr=%ld step=%lld",
+                  proc_us, stale_us, snap.hw_ptr,
+                  (long long)s->clock_step_frames);
     }
 
     hw = unwrap_hw_ptr(s->clock_last_hw, snap.hw_ptr);
