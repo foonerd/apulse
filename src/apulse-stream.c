@@ -996,8 +996,19 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
     }
 }
 
+static void
+alsa_error_quiet(const char *file, int line, const char *function, int err,
+                 const char *fmt, ...)
+{
+    (void)file;
+    (void)line;
+    (void)function;
+    (void)err;
+    (void)fmt;
+}
+
 static int
-do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction, int quiet)
+do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
 {
     snd_pcm_hw_params_t *hw_params;
     snd_pcm_sw_params_t *sw_params;
@@ -1028,9 +1039,15 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction, int quiet)
         goto fatal_error;
     }
 
+    // EBUSY is the other source still holding plug:volumio. The open is
+    // retried. volumioswitch prints its own "failed to open the switcher
+    // target" on that path; mute the ALSA handler for this call only so
+    // a handover does not look like a device fault in the journal.
+    snd_lib_error_set_handler(alsa_error_quiet);
     errcode = snd_pcm_open(&s->ph, device_name, stream_direction, 0);
+    snd_lib_error_set_handler(NULL);
     if (errcode < 0) {
-        if (!(quiet && errcode == -EBUSY))
+        if (errcode != -EBUSY)
             trace_error("%s: can't open %s. Error code %d (%s)\n", __func__,
                         device_description, errcode, snd_strerror(errcode));
         goto fatal_error;
@@ -1261,7 +1278,7 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction, int quiet)
     return 0;
 
 fatal_error:
-    if (!(quiet && errcode == -EBUSY))
+    if (errcode != -EBUSY)
         trace_error(
             "%s: failed to open ALSA device. Apulse does no resampling or "
             "format conversion, leaving that task to ALSA plugins. Ensure that "
@@ -1519,7 +1536,7 @@ stream_acquire_device(pa_stream *s)
     if (s->ph)
         return 0;
 
-    if (do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK, s->acquire_attempts > 0) <
+    if (do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK) <
         0) {
         if (!s->acquire_failed) {
             s->acquire_failed = 1;
@@ -1631,7 +1648,7 @@ pa_stream_connect_playback(pa_stream *s, const char *dev,
     stream_adjust_buffer_attrs(s, attr);
 
     {
-        int err = do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK, 0);
+        int err = do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK);
         int start_corked = !!(flags & PA_STREAM_START_CORKED);
 
         g_atomic_int_set(&s->paused, start_corked);
@@ -2625,7 +2642,7 @@ pa_stream_connect_record(pa_stream *s, const char *dev,
     s->direction = PA_STREAM_RECORD;
     stream_adjust_buffer_attrs(s, attr);
 
-    if (do_connect_pcm(s, SND_PCM_STREAM_CAPTURE, 0) < 0)
+    if (do_connect_pcm(s, SND_PCM_STREAM_CAPTURE) < 0)
         goto err;
 
     snd_pcm_start(s->ph);
