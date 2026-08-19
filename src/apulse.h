@@ -118,6 +118,12 @@ struct pa_stream {
     void *write_buffer;
     volatile int paused;
     pa_volume_t volume[PA_CHANNELS_MAX];
+    // Flow control for the playback io events. POLLOUT is level-triggered, so a
+    // wakeup with an empty ring is re-entered immediately and forever. These
+    // track the registered event mask so POLLOUT can be dropped when there is
+    // nothing to write and restored when the client writes again.
+    pa_io_event_flags_t ioe_events;
+    int out_enabled;
 };
 
 struct pa_operation {

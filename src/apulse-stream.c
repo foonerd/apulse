@@ -217,6 +217,57 @@ deh_stream_first_readwrite_callback(pa_mainloop_api *api, pa_defer_event *de,
     pa_stream_unref(s);
 }
 
+// ---------------------------------------------------------------------------
+// Playback flow control.
+//
+// POLLOUT is level-triggered. When the ring is empty the io callback has nothing
+// to write, returns without changing the registration, and is re-entered
+// immediately. Upstream masks this by writing a period of silence every time,
+// which keeps the callback rate sane but inserts silence into a pipeline that is
+// usually not short of audio, and advances the hardware pointer with frames the
+// client never wrote.
+//
+// Measured on device before this change: wake=99 wr=99 pad=49 padf=0 in every
+// single second. Half the wakeups wrote zero frames. Under a full ring after a
+// track change it degenerated further, into tens of thousands of wakeups per
+// second, saturating the mainloop thread that also serves the control socket.
+//
+// Instead, drop POLLOUT while there is nothing to send and restore it when the
+// client writes. No timers, no polling, no silence.
+// ---------------------------------------------------------------------------
+
+static void
+stream_set_output_enabled(pa_stream *s, int enable)
+{
+    pa_mainloop_api *api;
+    pa_io_event_flags_t events;
+
+    if (!s || !s->ioe || s->out_enabled == enable)
+        return;
+
+    api = s->c->mainloop_api;
+    if (!api || !api->io_enable)
+        return;
+
+    // Keep apulse's high-bit marker and any input interest; only PA_IO_EVENT_OUTPUT
+    // is toggled.
+    events = enable ? s->ioe_events : (s->ioe_events & ~PA_IO_EVENT_OUTPUT);
+
+    for (int k = 0; k < s->nioe; k++) {
+        if (s->ioe[k])
+            api->io_enable(s->ioe[k], events);
+    }
+    s->out_enabled = enable;
+}
+
+// Called from pa_stream_write and from cork, both of which mean the stream may
+// have something to send again.
+static void
+stream_wake_output(pa_stream *s)
+{
+    stream_set_output_enabled(s, 1);
+}
+
 static void
 data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
                           pa_io_event_flags_t events, void *userdata)
@@ -354,17 +405,18 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
 
             pa_apply_volume_multiplier(buf, bytecnt, s->volume, &s->ss);
 
-            int padded = 0;
             snd_pcm_sframes_t wr;
 
             if (bytecnt == 0) {
-                // application is not ready yet, play silence
-                bytecnt = MIN(buf_size, frame_count * frame_size);
-                memset(buf, 0, bytecnt);
-                padded = 1;
+                // Nothing to send. Stop asking until the client writes, rather
+                // than inserting silence or spinning on a level-triggered
+                // POLLOUT. The ALSA buffer keeps playing what it already holds.
+                stream_set_output_enabled(s, 0);
+                diag_tick(s);
+                return;
             }
             wr = snd_pcm_writei(s->ph, buf, bytecnt / frame_size);
-            diag_note_write(wr, bytecnt / frame_size, padded);
+            diag_note_write(wr, bytecnt / frame_size, 0);
         }
         diag_tick(s);
     }
@@ -559,12 +611,20 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
         __func__, (int)requested_buffer_size, (int)buffer_size,
         device_description);
 
+    snd_pcm_format_t negotiated_format = SND_PCM_FORMAT_UNKNOWN;
+
     errcode = snd_pcm_hw_params(s->ph, hw_params);
     if (errcode < 0) {
         trace_error("%s: can't apply configured hw parameter block for %s\n",
                     __func__, device_description);
         goto fatal_error;
     }
+
+    // Captured before the params block is freed. The Pulse spec says what the
+    // client asked for; this says what ALSA agreed to, which on a plug chain
+    // can differ. Without it a format problem is indistinguishable from a
+    // timing one.
+    snd_pcm_hw_params_get_format(hw_params, &negotiated_format);
 
     snd_pcm_hw_params_free(hw_params);
 
@@ -617,15 +677,25 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
         s->ioe[k] = api->io_new(api, fds[k].fd, 0x80000000 | fds[k].events,
                                 data_available_for_stream, s);
         s->ioe[k]->pcm = s->ph;
+        // Remember the full mask so flow control can restore it exactly.
+        s->ioe_events = 0x80000000 | fds[k].events;
     }
+    s->out_enabled = 1;
     free(fds);
 
-    diag_logf("connect %s: spec %s %u Hz %u ch frame=%zu | alsa period=%lu "
-              "buffer=%lu | tlength=%u minreq=%u prebuf=%u",
+    diag_logf("connect %s: pulse %s %u Hz %u ch frame=%zu | alsa %s period=%lu "
+              "buffer=%lu periods=%lu.%02lu fds=%d | tlength=%u minreq=%u "
+              "prebuf=%u",
               direction_name, diag_fmt_name(s->ss.format), s->ss.rate,
               s->ss.channels, pa_frame_size(&s->ss),
+              snd_pcm_format_name(negotiated_format),
               (unsigned long)period_size, (unsigned long)buffer_size,
-              s->buffer_attr.tlength, s->buffer_attr.minreq,
+              period_size ? (unsigned long)(buffer_size / period_size) : 0UL,
+              period_size
+                  ? (unsigned long)((buffer_size % period_size) * 100 /
+                                    period_size)
+                  : 0UL,
+              nfds, s->buffer_attr.tlength, s->buffer_attr.minreq,
               s->buffer_attr.prebuf);
     diag_reset();
 
@@ -822,6 +892,9 @@ pa_stream_cork_impl(pa_operation *op)
 {
     diag_logf("cork %d", op->int_arg_1 ? 1 : 0);
     g_atomic_int_set(&op->s->paused, !!(op->int_arg_1));
+    // Corked still writes silence to hold the device, and uncorked has audio to
+    // send, so either transition needs the output events active.
+    stream_wake_output(op->s);
 
     if (op->stream_success_cb)
         op->stream_success_cb(op->s, 1, op->cb_userdata);
@@ -879,8 +952,20 @@ pa_stream_disconnect(pa_stream *s)
         api->io_free(s->ioe[k]);
     }
     free(s->ioe);
+    s->ioe = NULL;
+    s->nioe = 0;
+    s->out_enabled = 0;
 
-    snd_pcm_close(s->ph);
+    // Upstream closed a RUNNING device with a full buffer. Observed on device:
+    // "disconnect: alsa state=RUNNING delay=42512". Drop first so the device is
+    // released idle and the next open starts from a known state.
+    if (s->ph) {
+        snd_pcm_drop(s->ph);
+        snd_pcm_close(s->ph);
+        s->ph = NULL;
+    }
+    if (s->rb)
+        ringbuffer_drop(s->rb, ringbuffer_readable_size(s->rb));
     s->state = PA_STREAM_TERMINATED;
 
     return PA_OK;
@@ -916,12 +1001,34 @@ pa_stream_drain(pa_stream *s, pa_stream_success_cb_t cb, void *userdata)
 static void
 pa_stream_flush_impl(pa_operation *op)
 {
-    // Upstream discards nothing here. Logged so a skip or seek is visible in
-    // the sequence, and so it is obvious that queued audio survives it.
-    diag_logf("flush (upstream no-op): rb=%zu",
-              op->s->rb ? ringbuffer_readable_size(op->s->rb) : 0);
+    pa_stream *s = op->s;
+    size_t queued = s->rb ? ringbuffer_readable_size(s->rb) : 0;
 
-    // TODO: is it ok to do nothing?
+    diag_logf("flush: discarding rb=%zu", queued);
+
+    // Upstream did nothing here and returned success, so a skip or a seek left
+    // the whole ring in place. Observed on device: Soloist corks, flushes and
+    // uncorks at every track change, and the flush found rb=73728 -- the ring
+    // completely full -- each time. The new track then had nowhere to go,
+    // pa_stream_writable_size returned 0, and playback stalled against stale
+    // audio. That is the choppiness after a quality change.
+    //
+    // Discard both stages: our ring, and whatever ALSA has already accepted.
+    if (s->rb && queued > 0)
+        ringbuffer_drop(s->rb, queued);
+
+    if (s->ph) {
+        // snd_pcm_drop leaves the device in SETUP, where snd_pcm_avail returns
+        // -EBADFD and the io callback treats the stream as closed. Prepare
+        // immediately, in the same operation, so the callback never observes
+        // that state.
+        snd_pcm_drop(s->ph);
+        snd_pcm_prepare(s->ph);
+    }
+
+    // The ring is empty by definition now, so leave output disabled until the
+    // client writes; that is also what stops a post-flush spin.
+    stream_set_output_enabled(s, 0);
 
     if (op->stream_success_cb)
         op->stream_success_cb(op->s, 1, op->cb_userdata);
@@ -1400,6 +1507,12 @@ pa_stream_write(pa_stream *s, const void *data, size_t nbytes,
     s->timing_info.since_underrun += written;
     dstat.client_bytes += (long)written;
     s->timing_info.write_index += written;
+
+    // There is something to send again. Flow control dropped POLLOUT when the
+    // ring ran dry; restore it now rather than waiting for a timer that does
+    // not exist.
+    if (written > 0)
+        stream_wake_output(s);
 
     if (data == s->write_buffer) {
         free(s->write_buffer);
