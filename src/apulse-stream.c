@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #define MAKE_SND_LIB_VERSION(a, b, c) (((a) << 16) | ((b) << 8) | (c))
 
@@ -797,6 +798,8 @@ stream_set_output_enabled(pa_stream *s, int enable)
 
 // Called from pa_stream_write and from cork, both of which mean the stream may
 // have something to send again.
+static int stream_maybe_yield(pa_stream *s);
+
 static void
 stream_wake_output(pa_stream *s)
 {
@@ -814,10 +817,9 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
     const size_t buf_size = pa_find_multiple_of(sizeof(buf), frame_size, 0);
     int paused = g_atomic_int_get(&s->paused);
 
-    // Corked playback has dropped the PCM and is waiting for uncork or idle
-    // release. Do not recover it back into RUNNING; that re-holds exclusive
-    // hardware for a stream that is about to give it up.
-    if (s->direction == PA_STREAM_PLAYBACK && paused && !s->want_running)
+    if (stream_maybe_yield(s))
+        return;
+    if (!s->ph)
         return;
 
     if (events & (PA_IO_EVENT_INPUT | PA_IO_EVENT_OUTPUT)) {
@@ -1433,32 +1435,34 @@ stream_adjust_buffer_attrs(pa_stream *s, const pa_buffer_attr *attr)
 // ---------------------------------------------------------------------------
 // Device ownership.
 //
-// plug:volumio is exclusive: the open handle is the lock. snd_pcm_drop and
-// snd_pcm_pause keep it. Only snd_pcm_close frees it for MPD, radio, DLNA.
+// plug:volumio is exclusive: the open handle is the lock. Cork is not a
+// close. Track change is cork/flush/uncork in milliseconds; pause/play is
+// the same pair. Closing or dropping on cork left the clock with no RUNNING
+// hw_ptr, read_index stuck at 0, and Soloist reporting [0:00] forever.
 //
-// Cork drops the PCM and arms the idle timer. It does not close. Track
-// change is cork/flush/uncork in a few milliseconds; closing on cork
-// left volumioswitch writing into a dead softvolume (update-check, DMA
-// IRQ with no descriptors, silence until pause/play). If the cork
-// holds, the timer closes (yield). APULSE_WRITE_IDLE_MS, default 200.
+// Cork freezes the clock and writes silence. The PCM stays open and
+// RUNNING. Flush still resets the indices (new track). Volumio yield is a
+// different event: the plugin creates APULSE_YIELD_PATH (default
+// /data/soloist/alsa.yield) from unsetVolatile/stop. That is the only
+// close. Uncork or a later write reacquires.
 // ---------------------------------------------------------------------------
 
-static void stream_arm_write_idle(pa_stream *s);
 static void stream_schedule_acquire(pa_stream *s);
 
-static unsigned
-write_idle_ms(void)
+static const char *
+yield_path(void)
 {
-    const char *e = getenv("APULSE_WRITE_IDLE_MS");
+    const char *e = getenv("APULSE_YIELD_PATH");
 
-    if (e && e[0]) {
-        char *end = NULL;
-        long v = strtol(e, &end, 10);
+    if (e && e[0])
+        return e;
+    return "/data/soloist/alsa.yield";
+}
 
-        if (end != e && v >= 50 && v <= 5000)
-            return (unsigned)v;
-    }
-    return 200;
+static int
+yield_requested(void)
+{
+    return access(yield_path(), F_OK) == 0;
 }
 
 static void
@@ -1498,14 +1502,46 @@ stream_after_ms(pa_stream *s, unsigned ms, pa_time_event_cb_t cb)
     return api->time_new(api, &tv, cb, s);
 }
 
+// Close the PCM but keep the playhead. The next open is a new hw_ptr
+// generation; origin is rebuilt from the frozen usec on the first RUNNING
+// sample so Soloist does not jump to 0:00 after a Volumio yield.
 static void
-stream_release_device(pa_stream *s)
+stream_clock_hold(pa_stream *s)
+{
+    pa_usec_t held = s->clock_frozen_usec ? s->clock_frozen_usec
+                                          : s->clock_last_played;
+    int64_t bytes;
+
+    s->clock_origin_hw = 0;
+    s->clock_last_hw = -1;
+    s->clock_have_origin = 0;
+    s->clock_have_path = 0;
+    s->clock_status_path[0] = '\0';
+    s->clock_model_at.tv_sec = 0;
+    s->clock_model_at.tv_usec = 0;
+    s->clock_model_frames = 0;
+    s->clock_model_rate = 0.0;
+    s->clock_model_valid = 0;
+    s->clock_running = 0;
+    s->clock_frozen_usec = held;
+    s->clock_last_played = held;
+
+    bytes = (int64_t)pa_usec_to_bytes(held, &s->ss);
+    if (bytes < 0)
+        bytes = 0;
+    s->timing_info.write_index = bytes;
+    s->timing_info.read_index = bytes;
+    s->timing_info.since_underrun = 0;
+}
+
+static void
+stream_release_device(pa_stream *s, int keep_position)
 {
     if (!s->ph)
         return;
 
-    diag_logf("release device: rb=%zu",
-              s->rb ? ringbuffer_readable_size(s->rb) : 0);
+    diag_logf("release device: rb=%zu keep_pos=%d",
+              s->rb ? ringbuffer_readable_size(s->rb) : 0, keep_position);
 
     for (int k = 0; k < s->nioe; k++) {
         pa_mainloop_api *api = s->c->mainloop_api;
@@ -1523,10 +1559,31 @@ stream_release_device(pa_stream *s)
 
     if (s->rb)
         ringbuffer_drop(s->rb, ringbuffer_readable_size(s->rb));
-    s->timing_info.write_index = 0;
-    s->timing_info.read_index = 0;
-    s->timing_info.since_underrun = 0;
-    stream_clock_reset(s);
+    if (keep_position) {
+        stream_clock_hold(s);
+    } else {
+        s->timing_info.write_index = 0;
+        s->timing_info.read_index = 0;
+        s->timing_info.since_underrun = 0;
+        stream_clock_reset(s);
+    }
+}
+
+static int
+stream_maybe_yield(pa_stream *s)
+{
+    if (!s || !s->ph || !yield_requested())
+        return 0;
+
+    diag_logf("yield: releasing device");
+    stream_cancel_time(s, &s->acquire_ev);
+    s->acquire_attempts = 0;
+    s->want_running = 0;
+    stream_clock_freeze(s);
+    g_atomic_int_set(&s->paused, 1);
+    stream_release_device(s, 1);
+    unlink(yield_path());
+    return 1;
 }
 
 static int
@@ -1535,8 +1592,7 @@ stream_acquire_device(pa_stream *s)
     if (s->ph)
         return 0;
 
-    if (do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK) <
-        0) {
+    if (do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK) < 0) {
         if (!s->acquire_failed) {
             s->acquire_failed = 1;
             diag_logf("reacquire device FAILED: device busy");
@@ -1564,58 +1620,13 @@ stream_request_write(pa_stream *s)
 }
 
 static void
-stream_pcm_run(pa_stream *s)
-{
-    if (!s->ph)
-        return;
-    if (snd_pcm_state(s->ph) == SND_PCM_STATE_PREPARED)
-        snd_pcm_start(s->ph);
-}
-
-static void
 stream_become_running(pa_stream *s)
 {
     stream_clock_start(s);
     g_atomic_int_set(&s->paused, 0);
-    // Idle-close emptied the ring and skipped the first-write defer
-    // (state is already READY). Without this request the POLLOUT
-    // handler sees an empty ring, drops POLLOUT, and stays silent
-    // until the next track change writes on its own.
-    stream_request_write(s);
-    stream_pcm_run(s);
+    if (s->rb && ringbuffer_readable_size(s->rb) == 0)
+        stream_request_write(s);
     stream_wake_output(s);
-}
-
-static void
-stream_write_idle_cb(pa_mainloop_api *a, pa_time_event *e,
-                     const struct timeval *tv, void *userdata)
-{
-    pa_stream *s = userdata;
-
-    (void)tv;
-    s->idle_ev = NULL;
-    if (a && a->time_free)
-        a->time_free(e);
-    if (!s->ph)
-        return;
-    // A write gap on a live stream is not a yield. Closing here dropped
-    // the PCM mid-track and the next open landed on a stale volumioswitch
-    // target. Release only after cork (want_running already 0, paused).
-    if (s->want_running && !g_atomic_int_get(&s->paused))
-        return;
-    diag_logf("write idle: releasing device");
-    stream_release_device(s);
-}
-
-static void
-stream_arm_write_idle(pa_stream *s)
-{
-    stream_cancel_time(s, &s->idle_ev);
-    if (!s->ph)
-        return;
-    s->idle_ev = stream_after_ms(s, write_idle_ms(), stream_write_idle_cb);
-    if (!s->idle_ev)
-        stream_release_device(s);
 }
 
 static void
@@ -1632,7 +1643,6 @@ stream_acquire_retry_cb(pa_mainloop_api *a, pa_time_event *e,
         return;
     if (stream_acquire_device(s) == 0) {
         stream_become_running(s);
-        stream_arm_write_idle(s);
         return;
     }
     stream_schedule_acquire(s);
@@ -1643,17 +1653,15 @@ stream_schedule_acquire(pa_stream *s)
 {
     static const unsigned backoff_ms[] = {50, 100, 200, 400, 800};
     unsigned i = (unsigned)s->acquire_attempts;
-    unsigned ms;
+    unsigned last = G_N_ELEMENTS(backoff_ms) - 1;
+    unsigned ms = (i > last) ? backoff_ms[last] : backoff_ms[i];
 
-    if (i >= G_N_ELEMENTS(backoff_ms)) {
-        if (!s->acquire_failed) {
-            s->acquire_failed = 1;
-            diag_logf("reacquire gave up: device busy, staying corked");
-        }
-        return;
+    if (i <= last)
+        s->acquire_attempts = (int)i + 1;
+    if (i == last && !s->acquire_failed) {
+        s->acquire_failed = 1;
+        diag_logf("reacquire still busy, retrying");
     }
-    ms = backoff_ms[i];
-    s->acquire_attempts = (int)i + 1;
     stream_cancel_time(s, &s->acquire_ev);
     s->acquire_ev = stream_after_ms(s, ms, stream_acquire_retry_cb);
     if (!s->acquire_ev && !s->acquire_failed) {
@@ -1704,11 +1712,6 @@ pa_stream_connect_playback(pa_stream *s, const char *dev,
                 stream_schedule_acquire(s);
             return 0;
         }
-
-        if (start_corked)
-            stream_release_device(s);
-        else
-            stream_arm_write_idle(s);
     }
 
     return 0;
@@ -1726,21 +1729,16 @@ pa_stream_cork_impl(pa_operation *op)
         s->want_running = 0;
         stream_clock_freeze(s);
         g_atomic_int_set(&s->paused, 1);
-        if (s->ph) {
-            snd_pcm_drop(s->ph);
-            stream_set_output_enabled(s, 0);
-        }
-        stream_arm_write_idle(s);
+        if (!stream_maybe_yield(s))
+            stream_wake_output(s);
     } else {
-        stream_cancel_time(s, &s->idle_ev);
         s->want_running = 1;
         if (s->ph) {
-            snd_pcm_prepare(s->ph);
-            stream_become_running(s);
-            stream_arm_write_idle(s);
+            stream_clock_start(s);
+            g_atomic_int_set(&s->paused, 0);
+            stream_wake_output(s);
         } else if (stream_acquire_device(s) == 0) {
             stream_become_running(s);
-            stream_arm_write_idle(s);
         } else {
             stream_schedule_acquire(s);
         }
@@ -1779,7 +1777,6 @@ pa_stream_disconnect(pa_stream *s)
     if (s->state != PA_STREAM_READY)
         return PA_ERR_BADSTATE;
 
-    stream_cancel_time(s, &s->idle_ev);
     stream_cancel_time(s, &s->acquire_ev);
 
     // Logged before the close so the state ALSA is being left in is visible.
@@ -2157,6 +2154,7 @@ stream_update_timing(pa_stream *s)
     pa_usec_t hw_usec;
     int64_t played;
 
+    stream_maybe_yield(s);
     gettimeofday(&s->timing_info.timestamp, NULL);
 
     hw_usec = stream_hw_time(s);
@@ -2492,7 +2490,6 @@ pa_stream_unref(pa_stream *s)
     if (s->ref_cnt == 0) {
         pa_context *c = s->c;
 
-        stream_cancel_time(s, &s->idle_ev);
         stream_cancel_time(s, &s->acquire_ev);
         g_hash_table_remove(s->c->streams_ht, GINT_TO_POINTER(s->idx));
         ringbuffer_free(s->rb);
@@ -2634,20 +2631,19 @@ pa_stream_write(pa_stream *s, const void *data, size_t nbytes,
     tstat.writes++;
     tstat.write_bytes += (long)written;
 
+    stream_maybe_yield(s);
+
     // There is something to send again. Flow control dropped POLLOUT when the
     // ring ran dry; restore it now rather than waiting for a timer that does
     // not exist.
     if (written > 0) {
         if (s->ph) {
             stream_wake_output(s);
-            stream_arm_write_idle(s);
         } else if (s->want_running) {
-            if (stream_acquire_device(s) == 0) {
+            if (stream_acquire_device(s) == 0)
                 stream_become_running(s);
-                stream_arm_write_idle(s);
-            } else {
+            else
                 stream_schedule_acquire(s);
-            }
         }
     }
 
