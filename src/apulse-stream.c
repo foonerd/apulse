@@ -1510,6 +1510,109 @@ pa_stream_get_time(pa_stream *s, pa_usec_t *r_usec)
     return 0;
 }
 
+// Observer for the four symbols Soloist actually resolves. The question this
+// answers is whether it interpolates: if it reads timing far more often than it
+// writes, it is estimating position between updates from timing_info.timestamp,
+// and the freshness of that timestamp matters more than read_index. If reads and
+// writes are one to one, it is not, and read_index is what has to be right.
+//
+// Four fixes have now been aimed at this symptom by inferring what Soloist does
+// with pa_timing_info. This logs what it is actually given.
+static struct {
+    struct timeval t0;
+    struct timeval last_read;
+    unsigned reads;        // pa_stream_get_timing_info
+    unsigned updates;      // pa_stream_update_timing_info
+    unsigned wsize;        // pa_stream_writable_size
+    unsigned writes;       // pa_stream_write
+    long write_bytes;
+    long wsize_zero;       // writable_size answers of 0: backpressure
+    long gap_min_us;
+    long gap_max_us;
+    long gap_sum_us;
+    unsigned gap_n;
+} tstat;
+
+static void
+diag_timing_read(pa_stream *s, const char *how)
+{
+    struct timeval now;
+    long gap = -1;
+
+    if (!diag_on())
+        return;
+
+    gettimeofday(&now, NULL);
+    if (tstat.last_read.tv_sec) {
+        gap = (now.tv_sec - tstat.last_read.tv_sec) * 1000000L +
+              (now.tv_usec - tstat.last_read.tv_usec);
+        if (tstat.gap_n == 0 || gap < tstat.gap_min_us)
+            tstat.gap_min_us = gap;
+        if (gap > tstat.gap_max_us)
+            tstat.gap_max_us = gap;
+        tstat.gap_sum_us += gap;
+        tstat.gap_n++;
+    }
+    tstat.last_read = now;
+
+    // Every field of the struct, because which ones the client uses is exactly
+    // what is unknown. Rate-limited to one line in ten to keep the journal
+    // readable while still showing the shape.
+    if ((tstat.reads + tstat.updates) % 10 == 0)
+        diag_logf("timing[%s] gap=%ldus w=%lld r=%lld fill=%lld "
+                  "sink=%llu transport=%llu cfg_sink=%llu since_underrun=%llu "
+                  "playing=%d ts=%ld.%06ld",
+                  how, gap,
+                  (long long)s->timing_info.write_index,
+                  (long long)s->timing_info.read_index,
+                  (long long)(s->timing_info.write_index -
+                              s->timing_info.read_index),
+                  (unsigned long long)s->timing_info.sink_usec,
+                  (unsigned long long)s->timing_info.transport_usec,
+                  (unsigned long long)s->timing_info.configured_sink_usec,
+                  (unsigned long long)s->timing_info.since_underrun,
+                  s->timing_info.playing,
+                  (long)s->timing_info.timestamp.tv_sec,
+                  (long)s->timing_info.timestamp.tv_usec);
+}
+
+static void
+diag_timing_tick(void)
+{
+    struct timeval now;
+    long ms;
+
+    if (!diag_on())
+        return;
+
+    gettimeofday(&now, NULL);
+    if (tstat.t0.tv_sec == 0) {
+        tstat.t0 = now;
+        return;
+    }
+    ms = (now.tv_sec - tstat.t0.tv_sec) * 1000 +
+         (now.tv_usec - tstat.t0.tv_usec) / 1000;
+    if (ms < 1000)
+        return;
+
+    diag_logf("1s api reads=%u updates=%u wsize=%u (zero=%ld) writes=%u "
+              "wbytes=%ld gap min/avg/max=%ld/%ld/%ld us",
+              tstat.reads, tstat.updates, tstat.wsize, tstat.wsize_zero,
+              tstat.writes, tstat.write_bytes,
+              tstat.gap_n ? tstat.gap_min_us : 0,
+              tstat.gap_n ? tstat.gap_sum_us / (long)tstat.gap_n : 0,
+              tstat.gap_n ? tstat.gap_max_us : 0);
+
+    {
+        struct timeval keep = now;
+        struct timeval last = tstat.last_read;
+
+        memset(&tstat, 0, sizeof(tstat));
+        tstat.t0 = keep;
+        tstat.last_read = last;
+    }
+}
+
 // Soloist reads only pa_timing_info. Confirmed from its dynamic symbols: it
 // resolves pa_stream_get_timing_info, pa_stream_update_timing_info,
 // pa_stream_writable_size and pa_stream_write, and neither pa_stream_get_time
@@ -1565,6 +1668,9 @@ pa_stream_get_timing_info(pa_stream *s)
     trace_info_f("F %s s=%p\n", __func__, s);
 
     stream_update_timing(s);
+    tstat.reads++;
+    diag_timing_read(s, "get");
+    diag_timing_tick();
 
     return &s->timing_info;
 }
@@ -1830,6 +1936,9 @@ pa_stream_update_timing_info_impl(pa_operation *op)
     // The client asked for fresh timing; give it the same data
     // pa_stream_get_timing_info would, not just a new timestamp.
     stream_update_timing(op->s);
+    tstat.updates++;
+    diag_timing_read(op->s, "upd");
+    diag_timing_tick();
 
     if (op->s->latency_update_cb)
         op->s->latency_update_cb(op->s, op->s->latency_update_cb_userdata);
@@ -1877,7 +1986,17 @@ pa_stream_writable_size(pa_stream *s)
     if (writable_size < limit)
         writable_size = 0;
 
-    return pa_find_multiple_of(writable_size, pa_frame_size(&s->ss), 0);
+    {
+        size_t out = pa_find_multiple_of(writable_size, pa_frame_size(&s->ss), 0);
+
+        // A zero answer is backpressure: the client wanted to write and we told
+        // it there was no room. Frequent zeros mean the ring is the constraint,
+        // not the client.
+        tstat.wsize++;
+        if (out == 0)
+            tstat.wsize_zero++;
+        return out;
+    }
 }
 
 APULSE_EXPORT
@@ -1908,6 +2027,8 @@ pa_stream_write(pa_stream *s, const void *data, size_t nbytes,
     s->timing_info.since_underrun += written;
     dstat.client_bytes += (long)written;
     s->timing_info.write_index += written;
+    tstat.writes++;
+    tstat.write_bytes += (long)written;
 
     // There is something to send again. Flow control dropped POLLOUT when the
     // ring ran dry; restore it now rather than waiting for a timer that does
