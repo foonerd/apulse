@@ -1494,9 +1494,22 @@ stream_acquire_device(pa_stream *s)
         return 0;
 
     if (do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK) < 0) {
-        diag_logf("reacquire device on uncork FAILED");
+        // Another source owns the chain. Observed at handover, before the
+        // plugin learned to send deactivate: volumioswitch could not open
+        // volumioLocalPlayback and this retried for as long as the client kept
+        // asking.
+        //
+        // Stay corked and say so once. The client is not playing, and
+        // pretending otherwise is what produced a transport that showed
+        // playing with the device in someone else's hands.
+        if (!s->acquire_failed) {
+            s->acquire_failed = 1;
+            diag_logf("reacquire device on uncork FAILED: device busy, "
+                      "staying corked");
+        }
         return -1;
     }
+    s->acquire_failed = 0;
 
     stream_set_output_enabled(s, 0);
     diag_logf("reacquired device on uncork");

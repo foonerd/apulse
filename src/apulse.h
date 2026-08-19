@@ -148,6 +148,9 @@ struct pa_stream {
     // Duration of the ALSA buffer actually opened, reported to the client as
     // configured_sink_usec so it knows what pipeline it is feeding.
     pa_usec_t configured_sink_usec;
+    // Set when a reacquire on uncork found the chain owned by another source,
+    // so the failure is logged once rather than on every attempt.
+    int acquire_failed;
 };
 
 struct pa_operation {
