@@ -1479,6 +1479,20 @@ stream_acquire_device(pa_stream *s)
         diag_logf("reacquire device on uncork FAILED");
         return -1;
     }
+
+    // do_connect_pcm sets out_enabled = 1 itself, and
+    // stream_set_output_enabled returns early when the flag already matches, so
+    // asking it to enable here does nothing and io_enable is never called on
+    // the newly created events. The ring then has audio with nothing waking to
+    // drain it: after a pause and play the transport showed playing with no
+    // sound until a track change forced a flush and fresh writes.
+    //
+    // Clear the flag first so the enable is real.
+    s->out_enabled = 0;
+    stream_set_output_enabled(s, 1);
+
+    diag_logf("reacquired device on uncork: rb=%zu",
+              s->rb ? ringbuffer_readable_size(s->rb) : 0);
     return 0;
 }
 
