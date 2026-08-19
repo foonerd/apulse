@@ -1509,6 +1509,13 @@ pa_stream_disconnect(pa_stream *s)
     if (s->rb)
         ringbuffer_drop(s->rb, ringbuffer_readable_size(s->rb));
     stream_clock_reset(s);
+    // Same reasoning as the flush path: the indices describe audio that no
+    // longer exists. A reconnect on this stream would otherwise start with a
+    // fill level inherited from the previous session, and writable_size, being
+    // bounded by tlength - fill, would report no room at all.
+    s->timing_info.write_index = 0;
+    s->timing_info.read_index = 0;
+    s->timing_info.since_underrun = 0;
     s->state = PA_STREAM_TERMINATED;
 
     return PA_OK;
@@ -1562,6 +1569,15 @@ pa_stream_flush_impl(pa_operation *op)
 
     // The position restarts with the audio it was measuring.
     stream_clock_reset(s);
+
+    // Both indices describe the audio that was just discarded, so they reset
+    // with it. Leaving write_index while read_index restarts makes the fill
+    // level look enormous, and since writable_size is bounded by
+    // tlength - fill, it then reports zero room forever and the client can
+    // never write the next track. That is a track change that appears to hang.
+    s->timing_info.write_index = 0;
+    s->timing_info.read_index = 0;
+    s->timing_info.since_underrun = 0;
 
     if (s->ph) {
         // snd_pcm_drop leaves the device in SETUP, where snd_pcm_avail returns
@@ -1837,10 +1853,10 @@ stream_update_timing(pa_stream *s)
     if (frame_size > 0)
         played -= played % (int64_t)frame_size;
 
-    // read_index is monotonic. The hardware never un-plays audio, so a lower
-    // answer means our clock lost its position, not that the DAC went
-    // backwards: before the first write, while corked, and after a flush
-    // resets the origin, stream_hw_time legitimately returns 0.
+    // read_index is monotonic within a stream generation. The hardware never
+    // un-plays audio, so a lower answer means our clock lost its position, not
+    // that the DAC went backwards: before the first write and while corked,
+    // stream_hw_time legitimately returns 0.
     //
     // Reporting that 0 was a real defect. Observed on device:
     //
@@ -1855,7 +1871,15 @@ stream_update_timing(pa_stream *s)
     // Hold the previous value instead. A position that stops advancing is
     // honest about a clock that has stopped; a position that collapses to zero
     // is not.
-    if (played < s->timing_info.read_index)
+    //
+    // A flush ends the generation: it discards the audio both indices were
+    // measuring and zeroes them, so there is nothing to be monotonic against
+    // and the hold must not apply. Without that exception read_index stays
+    // pinned at the old value, gets clamped down to the freshly zeroed
+    // write_index, and the fill level is meaningless until the clock catches
+    // up.
+    if (s->timing_info.write_index > 0 &&
+        played < s->timing_info.read_index)
         played = s->timing_info.read_index;
 
     // The hardware cannot have played more than the client wrote.
