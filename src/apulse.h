@@ -124,6 +124,18 @@ struct pa_stream {
     // nothing to write and restored when the client writes again.
     pa_io_event_flags_t ioe_events;
     int out_enabled;
+    // Hardware playback clock. hw_ptr read from /proc/asound on the real DAC,
+    // not snd_pcm_delay, which through volumioswitch reports local + target and
+    // so describes two stages rather than the one we feed.
+    int64_t clock_origin_hw;
+    int64_t clock_last_hw;
+    pa_usec_t clock_frozen_usec;
+    pa_usec_t clock_last_played;
+    int clock_running;
+    int clock_have_origin;
+    int clock_have_path;
+    int clock_logged;
+    char clock_status_path[576];
 };
 
 struct pa_operation {

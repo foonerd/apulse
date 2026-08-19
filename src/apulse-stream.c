@@ -25,7 +25,10 @@
 #include "apulse.h"
 #include "trace.h"
 #include "util.h"
+#include <dirent.h>
 #include <stdarg.h>
+#include <stdint.h>
+#include <string.h>
 
 #define MAKE_SND_LIB_VERSION(a, b, c) (((a) << 16) | ((b) << 8) | (c))
 
@@ -215,6 +218,346 @@ deh_stream_first_readwrite_callback(pa_mainloop_api *api, pa_defer_event *de,
             s->read_cb(s, readable_size, s->read_cb_userdata);
     }
     pa_stream_unref(s);
+}
+
+// ---------------------------------------------------------------------------
+// Hardware playback clock.
+//
+// snd_pcm_delay through volumioswitch is not a description of the pipeline we
+// feed. That ioplug keeps its own buffer and separately sizes its target's, and
+// reports the sum:
+//
+//     *delayp = local_delay + target_delay;
+//
+// Measured on device: delay=43282 against a negotiated buffer of 22050, with
+// avail permanently 0. Soloist derives playback position and remaining backlog
+// from that figure and steers speed by the difference, so it rushes, corrects,
+// and chops while the write path is provably healthy (frames=44100/s, no
+// xruns, no short writes).
+//
+// Capping the reported number does not fix it: a bounded wrong answer is still
+// wrong, and the correction never converges. The fix is a different
+// measurement, not a corrected one. hw_ptr from /proc/asound is frames the
+// hardware has actually consumed, which no ioplug can inflate.
+//
+// If hw_ptr cannot be read, the clock holds its last value and says so once.
+// It never falls back to the wall clock or to write_index; both were tried and
+// both hunt, because neither is the DAC.
+// ---------------------------------------------------------------------------
+
+// "/proc/asound/" + NAME_MAX + NUL, and card path + "/" + NAME_MAX +
+// "/sub0/status". Sized for NAME_MAX so a long entry cannot truncate a path and
+// make the scan skip a PCM silently.
+#define APULSE_CARD_PATH 288
+#define APULSE_PCM_PATH 576
+
+// SND_PCM_IOPLUG_HW_BUFFER_BYTES is 524288, which is 65536 frames at S24
+// stereo. A PCM reporting a buffer that large is the switch, not the DAC.
+#define IOPLUG_MAX_FRAMES 65536
+
+struct hw_pcm_snap {
+    char status_path[APULSE_PCM_PATH];
+    long delay;
+    long avail;
+    long hw_ptr;
+    long buffer_size;
+    unsigned rate;
+    int ioplug;
+};
+
+static int
+read_key_long(const char *path, const char *key, long *out)
+{
+    FILE *f = fopen(path, "r");
+    char line[256];
+    size_t klen;
+
+    if (!f)
+        return -1;
+    klen = strlen(key);
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, key, klen) != 0)
+            continue;
+        char *colon = strchr(line, ':');
+
+        if (!colon)
+            continue;
+        *out = strtol(colon + 1, NULL, 10);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return -1;
+}
+
+static int
+read_key_u(const char *path, const char *key, unsigned *out)
+{
+    long v;
+
+    if (read_key_long(path, key, &v) < 0)
+        return -1;
+    if (v < 0)
+        return -1;
+    *out = (unsigned)v;
+    return 0;
+}
+
+static int
+status_is_running(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    char line[256];
+
+    if (!f)
+        return 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "state", 5) != 0)
+            continue;
+        fclose(f);
+        return strstr(line, "RUNNING") != NULL;
+    }
+    fclose(f);
+    return 0;
+}
+
+// snd-aloop presents a playback PCM that is not a DAC. Skip it, or the clock
+// can lock onto a loopback that no speaker is attached to.
+static int
+card_is_loopback(const char *card_dir)
+{
+    char idpath[APULSE_PCM_PATH];
+    char id[64];
+    FILE *f;
+    int n;
+
+    n = snprintf(idpath, sizeof(idpath), "%s/id", card_dir);
+    if (n < 0 || (size_t)n >= sizeof(idpath))
+        return 0;
+    f = fopen(idpath, "r");
+    if (!f)
+        return 0;
+    if (!fgets(id, sizeof(id), f)) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return strncmp(id, "Loopback", 8) == 0;
+}
+
+static int
+read_hw_pcm_snap(const char *status_path, struct hw_pcm_snap *o)
+{
+    char hw_params[APULSE_PCM_PATH];
+    size_t n;
+
+    memset(o, 0, sizeof(*o));
+    n = strlen(status_path);
+    if (n >= sizeof(o->status_path) || n < 7)
+        return -1;
+    memcpy(o->status_path, status_path, n + 1);
+    if (strcmp(status_path + n - 6, "status") != 0)
+        return -1;
+    memcpy(hw_params, status_path, n - 6);
+    memcpy(hw_params + n - 6, "hw_params", 10);
+
+    if (!status_is_running(status_path))
+        return -1;
+    if (read_key_long(status_path, "hw_ptr", &o->hw_ptr) < 0)
+        return -1;
+    if (read_key_long(status_path, "delay", &o->delay) < 0)
+        o->delay = -1;
+    if (read_key_long(status_path, "avail", &o->avail) < 0)
+        o->avail = -1;
+    if (read_key_long(hw_params, "buffer_size", &o->buffer_size) < 0)
+        o->buffer_size = -1;
+    if (read_key_u(hw_params, "rate", &o->rate) < 0)
+        o->rate = 0;
+    o->ioplug = (o->buffer_size >= IOPLUG_MAX_FRAMES);
+    return 0;
+}
+
+static int
+scan_hw_pcm(unsigned want_rate, struct hw_pcm_snap *best)
+{
+    DIR *cards;
+    struct dirent *ce;
+    int found = 0;
+    struct hw_pcm_snap pick;
+
+    memset(&pick, 0, sizeof(pick));
+    cards = opendir("/proc/asound");
+    if (!cards)
+        return -1;
+
+    while ((ce = readdir(cards))) {
+        char card_dir[APULSE_CARD_PATH];
+        DIR *pcms;
+        struct dirent *pe;
+        int n;
+
+        if (strncmp(ce->d_name, "card", 4) != 0)
+            continue;
+        n = snprintf(card_dir, sizeof(card_dir), "/proc/asound/%s",
+                     ce->d_name);
+        if (n < 0 || (size_t)n >= sizeof(card_dir))
+            continue;
+        if (card_is_loopback(card_dir))
+            continue;
+        pcms = opendir(card_dir);
+        if (!pcms)
+            continue;
+        while ((pe = readdir(pcms))) {
+            char status_path[APULSE_PCM_PATH];
+            struct hw_pcm_snap snap;
+            size_t plen = strlen(pe->d_name);
+            int sn;
+
+            if (plen < 2 || pe->d_name[0] != 'p' ||
+                strncmp(pe->d_name, "pcm", 3) != 0)
+                continue;
+            if (pe->d_name[plen - 1] != 'p')
+                continue;
+            sn = snprintf(status_path, sizeof(status_path),
+                          "%s/%s/sub0/status", card_dir, pe->d_name);
+            if (sn < 0 || (size_t)sn >= sizeof(status_path))
+                continue;
+            if (read_hw_pcm_snap(status_path, &snap) < 0)
+                continue;
+            if (want_rate && snap.rate && snap.rate != want_rate)
+                continue;
+            if (!found) {
+                pick = snap;
+                found = 1;
+                continue;
+            }
+            // Prefer the DAC over the ioplug-sized buffer, then the smaller
+            // delay, which is the one closer to the hardware pointer.
+            if (pick.ioplug && !snap.ioplug)
+                pick = snap;
+            else if (pick.ioplug == snap.ioplug && snap.delay >= 0 &&
+                     (pick.delay < 0 || snap.delay < pick.delay))
+                pick = snap;
+        }
+        closedir(pcms);
+    }
+    closedir(cards);
+    if (!found)
+        return -1;
+    *best = pick;
+    return 0;
+}
+
+// hw_ptr in /proc/asound is printed as a 32-bit value and wraps. Track the high
+// word so a long session does not jump backwards every 27 hours at 44100.
+static int64_t
+unwrap_hw_ptr(int64_t last, long raw)
+{
+    int64_t cur = (int64_t)(uint32_t)raw;
+
+    if (last < 0)
+        return (int64_t)raw;
+    {
+        int64_t last32 = last & 0xffffffffLL;
+        int64_t hi = last - last32;
+
+        if (cur + 0x40000000LL < last32)
+            hi += 0x100000000LL;
+        return hi + cur;
+    }
+}
+
+static void
+stream_clock_reset(pa_stream *s)
+{
+    s->clock_origin_hw = 0;
+    s->clock_last_hw = -1;
+    s->clock_frozen_usec = 0;
+    s->clock_last_played = 0;
+    s->clock_running = 0;
+    s->clock_have_origin = 0;
+    s->clock_have_path = 0;
+    s->clock_status_path[0] = '\0';
+}
+
+static void
+stream_clock_start(pa_stream *s)
+{
+    s->clock_running = 1;
+}
+
+// Corking stops the DAC advancing on our behalf, so freeze at the last known
+// position rather than letting hw_ptr keep running under a paused stream.
+static void
+stream_clock_freeze(pa_stream *s)
+{
+    if (!s->clock_running)
+        return;
+    s->clock_frozen_usec = s->clock_last_played;
+    s->clock_running = 0;
+}
+
+static pa_usec_t
+stream_hw_time(pa_stream *s)
+{
+    struct hw_pcm_snap snap;
+    int64_t hw;
+    int64_t frames;
+    pa_usec_t played;
+    unsigned rate = s->ss.rate;
+
+    if (!s->clock_running)
+        return s->clock_frozen_usec;
+    if (rate == 0)
+        return s->clock_last_played;
+
+    if (!s->clock_have_path) {
+        if (scan_hw_pcm(rate, &snap) == 0) {
+            snprintf(s->clock_status_path, sizeof(s->clock_status_path), "%s",
+                     snap.status_path);
+            s->clock_have_path = 1;
+            if (!s->clock_logged) {
+                diag_logf("play_clock %s hw_ptr=%ld delay=%ld buffer=%ld "
+                          "ioplug=%d",
+                          snap.status_path, snap.hw_ptr, snap.delay,
+                          snap.buffer_size, snap.ioplug);
+                s->clock_logged = 1;
+            }
+        } else {
+            // Explicit, once. No silent fallback to the wall clock or to
+            // write_index: both were tried on this device and both hunt.
+            if (!s->clock_logged) {
+                diag_logf("play_clock: no hardware hw_ptr found; position held");
+                s->clock_logged = 1;
+            }
+            return s->clock_last_played;
+        }
+    } else if (read_hw_pcm_snap(s->clock_status_path, &snap) < 0) {
+        s->clock_have_path = 0;
+        return s->clock_last_played;
+    }
+
+    hw = unwrap_hw_ptr(s->clock_last_hw, snap.hw_ptr);
+    s->clock_last_hw = hw;
+    if (!s->clock_have_origin) {
+        s->clock_origin_hw = hw;
+        s->clock_have_origin = 1;
+        // Resuming after a cork: place the origin so the position continues
+        // from where it froze instead of restarting at zero.
+        if (s->clock_frozen_usec > 0 && rate > 0)
+            s->clock_origin_hw =
+                hw - (int64_t)((uint64_t)s->clock_frozen_usec * rate /
+                               1000000ULL);
+    }
+    frames = hw - s->clock_origin_hw;
+    if (frames < 0)
+        frames = 0;
+    played = (pa_usec_t)((uint64_t)frames * 1000000ULL / rate);
+    // Monotonic by contract: pa_stream_get_time must never go backwards.
+    if (played < s->clock_last_played)
+        played = s->clock_last_played;
+    s->clock_last_played = played;
+    return played;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +759,8 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
                 return;
             }
             wr = snd_pcm_writei(s->ph, buf, bytecnt / frame_size);
+            if (wr > 0)
+                stream_clock_start(s);
             diag_note_write(wr, bytecnt / frame_size, 0);
         }
         diag_tick(s);
@@ -891,6 +1236,10 @@ static void
 pa_stream_cork_impl(pa_operation *op)
 {
     diag_logf("cork %d", op->int_arg_1 ? 1 : 0);
+    if (op->int_arg_1)
+        stream_clock_freeze(op->s);
+    else if (op->s->clock_have_origin || op->s->clock_frozen_usec)
+        stream_clock_start(op->s);
     g_atomic_int_set(&op->s->paused, !!(op->int_arg_1));
     // Corked still writes silence to hold the device, and uncorked has audio to
     // send, so either transition needs the output events active.
@@ -966,6 +1315,7 @@ pa_stream_disconnect(pa_stream *s)
     }
     if (s->rb)
         ringbuffer_drop(s->rb, ringbuffer_readable_size(s->rb));
+    stream_clock_reset(s);
     s->state = PA_STREAM_TERMINATED;
 
     return PA_OK;
@@ -1016,6 +1366,9 @@ pa_stream_flush_impl(pa_operation *op)
     // Discard both stages: our ring, and whatever ALSA has already accepted.
     if (s->rb && queued > 0)
         ringbuffer_drop(s->rb, queued);
+
+    // The position restarts with the audio it was measuring.
+    stream_clock_reset(s);
 
     if (s->ph) {
         // snd_pcm_drop leaves the device in SETUP, where snd_pcm_avail returns
@@ -1149,13 +1502,60 @@ pa_stream_get_time(pa_stream *s, pa_usec_t *r_usec)
 {
     trace_info_f("F %s\n", __func__);
 
-    // TODO: handle playback/capture delays?
-    int64_t data_index = s->timing_info.write_index;
-    if (data_index < 0)
-        data_index = 0;
-
-    *r_usec = pa_bytes_to_usec(data_index, &s->ss);
+    // Hardware consumption, not write_index. Returning the write index made a
+    // burst write jump the reported position by the duration written, which is
+    // not a sink clock and is what Soloist steers from.
+    if (r_usec)
+        *r_usec = stream_hw_time(s);
     return 0;
+}
+
+// Soloist reads only pa_timing_info. Confirmed from its dynamic symbols: it
+// resolves pa_stream_get_timing_info, pa_stream_update_timing_info,
+// pa_stream_writable_size and pa_stream_write, and neither pa_stream_get_time
+// nor pa_stream_get_latency. So this struct is the entire timing contract, and
+// it must be self-consistent on its own.
+//
+// Two counters and one clock, all describing the same audio:
+//
+//   write_index  bytes the client handed us          (pa_stream_write)
+//   read_index   bytes the DAC has actually played   (hw_ptr)
+//   fill level   write_index - read_index            (everything in flight)
+//
+// read_index was previously write_index minus snd_pcm_delay, which through
+// volumioswitch is local + target: two stages against a buffer sized for one.
+// Measured 43654 frames against a negotiated 22050. Deriving the fill level
+// from that made Soloist believe it was roughly twice as far ahead as it was,
+// so it slowed, overshot, and chopped.
+static void
+stream_update_timing(pa_stream *s)
+{
+    const size_t frame_size = pa_frame_size(&s->ss);
+    int64_t played;
+
+    gettimeofday(&s->timing_info.timestamp, NULL);
+
+    played = (int64_t)pa_usec_to_bytes(stream_hw_time(s), &s->ss);
+    if (frame_size > 0)
+        played -= played % (int64_t)frame_size;
+    if (played < 0)
+        played = 0;
+
+    // The hardware cannot have played more than the client wrote. It can look
+    // that way for a moment at startup, before the clock origin settles.
+    if (played > s->timing_info.write_index)
+        played = s->timing_info.write_index;
+
+    s->timing_info.read_index = played;
+    s->timing_info.read_index_corrupt = 0;
+    s->timing_info.write_index_corrupt = 0;
+    s->timing_info.playing = !g_atomic_int_get(&s->paused);
+
+    // read_index is already hardware consumption, so nothing further sits
+    // between the sink and the speaker. Reporting a separate sink latency here
+    // would double-count the same audio.
+    s->timing_info.sink_usec = 0;
+    s->timing_info.transport_usec = 0;
 }
 
 APULSE_EXPORT
@@ -1164,10 +1564,7 @@ pa_stream_get_timing_info(pa_stream *s)
 {
     trace_info_f("F %s s=%p\n", __func__, s);
 
-    snd_pcm_sframes_t delay = stream_reported_delay(s);
-
-    s->timing_info.read_index =
-        s->timing_info.write_index - delay * pa_frame_size(&s->ss);
+    stream_update_timing(s);
 
     return &s->timing_info;
 }
@@ -1271,6 +1668,8 @@ pa_stream_new_with_proplist(pa_context *c, const char *name,
 
     s->idx = c->next_stream_idx++;
     g_hash_table_insert(c->streams_ht, GINT_TO_POINTER(s->idx), s);
+
+    stream_clock_reset(s);
 
     diag_logf("new stream idx=%u: spec %s %u Hz %u ch frame=%zu", s->idx,
               diag_fmt_name(s->ss.format), s->ss.rate, s->ss.channels,
@@ -1428,7 +1827,9 @@ pa_stream_unref(pa_stream *s)
 static void
 pa_stream_update_timing_info_impl(pa_operation *op)
 {
-    gettimeofday(&op->s->timing_info.timestamp, NULL);
+    // The client asked for fresh timing; give it the same data
+    // pa_stream_get_timing_info would, not just a new timestamp.
+    stream_update_timing(op->s);
 
     if (op->s->latency_update_cb)
         op->s->latency_update_cb(op->s, op->s->latency_update_cb_userdata);
