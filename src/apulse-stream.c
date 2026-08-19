@@ -1416,47 +1416,33 @@ stream_adjust_buffer_attrs(pa_stream *s, const pa_buffer_attr *attr)
 // ---------------------------------------------------------------------------
 // Device ownership.
 //
-// Upstream apulse corks by writing silence into an open PCM. That is correct
-// on a dmix device, which is what apulse documents. plug:volumio is exclusive:
-// the handle is the lock, and silence still holds it.
+// plug:volumio is exclusive: the open handle is the lock. snd_pcm_drop and
+// snd_pcm_pause keep it. Only snd_pcm_close frees it for MPD, radio, DLNA.
 //
-// ALSA has no yield-without-close. snd_pcm_pause and snd_pcm_drop keep the
-// handle; only snd_pcm_close releases the kernel device. A real Pulse server
-// does not close on cork either. It keeps the sink up through cork/flush/uncork
-// (Soloist does that triple on every track change) and module-suspend-on-idle
-// closes the ALSA sink after the sink has been idle, default 5 s.
-//
-// Immediate close-on-cork was the wrong mapping of that. It made every skip
-// a new device instance (hw_ptr back to zero against a held read_index) and
-// it raced the next open against volumioswitch teardown, which is the EBUSY
-// in the journal. The close belongs on the idle timer, after the short cork
-// has either uncorked or stayed corked. Pulse uses 5 s; Volumio starts the
-// next source as soon as the volatile callback returns, so the default here
-// is 150 ms. APULSE_IDLE_RELEASE_MS overrides it.
-//
-// Uncork against a still-open handle is a prepare, not a restart. Uncork
-// after idle close is a new open and must obey the flush contract (indices
-// and clock already reset by the release). If that open is EBUSY, the other
-// source won a handover race: retry with backoff for ~1.5 s, then stay
-// corked. Writes still land in the ring.
+// Cork closes now. Track change is cork/flush/uncork: flush resets the ring
+// without a handle, uncork opens a new one, and stream_release_device has
+// already zeroed the indices so hw_ptr starting at zero is not a stall.
+// Pause that never corks is the other hostage path: arm a write-idle timer
+// on every write and close when audio stops. APULSE_WRITE_IDLE_MS, default
+// 200. Uncork or a later write with want_running reopens; EBUSY retries.
 // ---------------------------------------------------------------------------
 
-static void stream_schedule_idle_release(pa_stream *s);
+static void stream_arm_write_idle(pa_stream *s);
 static void stream_schedule_acquire(pa_stream *s);
 
 static unsigned
-idle_release_ms(void)
+write_idle_ms(void)
 {
-    const char *e = getenv("APULSE_IDLE_RELEASE_MS");
+    const char *e = getenv("APULSE_WRITE_IDLE_MS");
 
     if (e && e[0]) {
         char *end = NULL;
         long v = strtol(e, &end, 10);
 
-        if (end != e && v >= 20 && v <= 5000)
+        if (end != e && v >= 50 && v <= 5000)
             return (unsigned)v;
     }
-    return 150;
+    return 200;
 }
 
 static void
@@ -1559,8 +1545,8 @@ stream_become_running(pa_stream *s)
 }
 
 static void
-stream_idle_release_cb(pa_mainloop_api *a, pa_time_event *e,
-                       const struct timeval *tv, void *userdata)
+stream_write_idle_cb(pa_mainloop_api *a, pa_time_event *e,
+                     const struct timeval *tv, void *userdata)
 {
     pa_stream *s = userdata;
 
@@ -1568,16 +1554,19 @@ stream_idle_release_cb(pa_mainloop_api *a, pa_time_event *e,
     s->idle_ev = NULL;
     if (a && a->time_free)
         a->time_free(e);
-    if (s->want_running || !g_atomic_int_get(&s->paused))
+    if (!s->ph)
         return;
+    diag_logf("write idle: releasing device");
     stream_release_device(s);
 }
 
 static void
-stream_schedule_idle_release(pa_stream *s)
+stream_arm_write_idle(pa_stream *s)
 {
     stream_cancel_time(s, &s->idle_ev);
-    s->idle_ev = stream_after_ms(s, idle_release_ms(), stream_idle_release_cb);
+    if (!s->ph)
+        return;
+    s->idle_ev = stream_after_ms(s, write_idle_ms(), stream_write_idle_cb);
     if (!s->idle_ev)
         stream_release_device(s);
 }
@@ -1596,6 +1585,7 @@ stream_acquire_retry_cb(pa_mainloop_api *a, pa_time_event *e,
         return;
     if (stream_acquire_device(s) == 0) {
         stream_become_running(s);
+        stream_arm_write_idle(s);
         return;
     }
     stream_schedule_acquire(s);
@@ -1669,7 +1659,9 @@ pa_stream_connect_playback(pa_stream *s, const char *dev,
         }
 
         if (start_corked)
-            stream_schedule_idle_release(s);
+            stream_release_device(s);
+        else
+            stream_arm_write_idle(s);
     }
 
     return 0;
@@ -1683,23 +1675,22 @@ pa_stream_cork_impl(pa_operation *op)
     diag_logf("cork %d", op->int_arg_1 ? 1 : 0);
     if (op->int_arg_1) {
         stream_cancel_time(s, &s->acquire_ev);
+        stream_cancel_time(s, &s->idle_ev);
         s->acquire_attempts = 0;
         s->want_running = 0;
         stream_clock_freeze(s);
         g_atomic_int_set(&s->paused, 1);
-        if (s->ph) {
-            snd_pcm_drop(s->ph);
-            stream_set_output_enabled(s, 0);
-        }
-        stream_schedule_idle_release(s);
+        stream_release_device(s);
     } else {
         stream_cancel_time(s, &s->idle_ev);
         s->want_running = 1;
         if (s->ph) {
             snd_pcm_prepare(s->ph);
             stream_become_running(s);
+            stream_arm_write_idle(s);
         } else if (stream_acquire_device(s) == 0) {
             stream_become_running(s);
+            stream_arm_write_idle(s);
         } else {
             stream_schedule_acquire(s);
         }
@@ -2596,8 +2587,19 @@ pa_stream_write(pa_stream *s, const void *data, size_t nbytes,
     // There is something to send again. Flow control dropped POLLOUT when the
     // ring ran dry; restore it now rather than waiting for a timer that does
     // not exist.
-    if (written > 0)
-        stream_wake_output(s);
+    if (written > 0) {
+        if (s->ph) {
+            stream_wake_output(s);
+            stream_arm_write_idle(s);
+        } else if (s->want_running) {
+            if (stream_acquire_device(s) == 0) {
+                stream_become_running(s);
+                stream_arm_write_idle(s);
+            } else {
+                stream_schedule_acquire(s);
+            }
+        }
+    }
 
     if (data == s->write_buffer) {
         free(s->write_buffer);

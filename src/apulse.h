@@ -151,7 +151,7 @@ struct pa_stream {
     // Last cork request from the client. Uncork sets it; a failed reacquire
     // leaves it set so the backoff timer can keep trying.
     int want_running;
-    // Cork idle-release and EBUSY-retry timers. Both are Pulse mainloop
+    // Write-idle release and EBUSY-retry timers. Both are Pulse mainloop
     // time events; NULL when idle. Must be freed before the stream is.
     pa_time_event *idle_ev;
     pa_time_event *acquire_ev;
