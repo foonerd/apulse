@@ -123,6 +123,31 @@ pa_apply_volume_multiplier(void *buf, size_t sz,
         return;
     }
 
+    // Leave the stream at full scale when APULSE_UNITY_VOLUME is set.
+    //
+    // On Volumio the ALSA chain has its own fader (softvol) and, above it,
+    // per-source meters. A meter reads the signal where it is inserted, so
+    // scaling here delivers post-fader audio into the chain and the meter
+    // follows the volume knob instead of the music. Every other source on the
+    // system feeds full-scale audio and lets softvol attenuate.
+    //
+    // Scaling here also attenuates twice: once in this function, once in
+    // softvol, so 50% on both is 25% out.
+    //
+    // Behind an environment variable rather than removed, because a client on a
+    // system with no mixer downstream still needs this to work.
+    {
+        static int unity = -1;
+
+        if (unity < 0) {
+            const char *e = getenv("APULSE_UNITY_VOLUME");
+
+            unity = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (unity)
+            return;
+    }
+
     int all_normal = 1;
     for (uint32_t k = 0; k < channels; k++)
         all_normal = all_normal && (volume[k] == PA_VOLUME_NORM);
