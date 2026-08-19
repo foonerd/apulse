@@ -1436,12 +1436,11 @@ stream_adjust_buffer_attrs(pa_stream *s, const pa_buffer_attr *attr)
 // plug:volumio is exclusive: the open handle is the lock. snd_pcm_drop and
 // snd_pcm_pause keep it. Only snd_pcm_close frees it for MPD, radio, DLNA.
 //
-// Cork closes now. Track change is cork/flush/uncork: flush resets the ring
-// without a handle, uncork opens a new one, and stream_release_device has
-// already zeroed the indices so hw_ptr starting at zero is not a stall.
-// Pause that never corks is the other hostage path: arm a write-idle timer
-// on every write and close when audio stops. APULSE_WRITE_IDLE_MS, default
-// 200. Uncork or a later write with want_running reopens; EBUSY retries.
+// Cork drops the PCM and arms the idle timer. It does not close. Track
+// change is cork/flush/uncork in a few milliseconds; closing on cork
+// left volumioswitch writing into a dead softvolume (update-check, DMA
+// IRQ with no descriptors, silence until pause/play). If the cork
+// holds, the timer closes (yield). APULSE_WRITE_IDLE_MS, default 200.
 // ---------------------------------------------------------------------------
 
 static void stream_arm_write_idle(pa_stream *s);
@@ -1697,12 +1696,15 @@ pa_stream_cork_impl(pa_operation *op)
     diag_logf("cork %d", op->int_arg_1 ? 1 : 0);
     if (op->int_arg_1) {
         stream_cancel_time(s, &s->acquire_ev);
-        stream_cancel_time(s, &s->idle_ev);
         s->acquire_attempts = 0;
         s->want_running = 0;
         stream_clock_freeze(s);
         g_atomic_int_set(&s->paused, 1);
-        stream_release_device(s);
+        if (s->ph) {
+            snd_pcm_drop(s->ph);
+            stream_set_output_enabled(s, 0);
+        }
+        stream_arm_write_idle(s);
     } else {
         stream_cancel_time(s, &s->idle_ev);
         s->want_running = 1;
