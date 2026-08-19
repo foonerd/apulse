@@ -26,9 +26,12 @@
 #include "trace.h"
 #include "util.h"
 #include <dirent.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 
 #define MAKE_SND_LIB_VERSION(a, b, c) (((a) << 16) | ((b) << 8) | (c))
 
@@ -811,6 +814,12 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
     const size_t buf_size = pa_find_multiple_of(sizeof(buf), frame_size, 0);
     int paused = g_atomic_int_get(&s->paused);
 
+    // Corked playback has dropped the PCM and is waiting for uncork or idle
+    // release. Do not recover it back into RUNNING; that re-holds exclusive
+    // hardware for a stream that is about to give it up.
+    if (s->direction == PA_STREAM_PLAYBACK && paused && !s->want_running)
+        return;
+
     if (events & (PA_IO_EVENT_INPUT | PA_IO_EVENT_OUTPUT)) {
 
 #if HAVE_SND_PCM_AVAIL
@@ -988,7 +997,7 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
 }
 
 static int
-do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
+do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction, int quiet)
 {
     snd_pcm_hw_params_t *hw_params;
     snd_pcm_sw_params_t *sw_params;
@@ -1021,8 +1030,9 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
 
     errcode = snd_pcm_open(&s->ph, device_name, stream_direction, 0);
     if (errcode < 0) {
-        trace_error("%s: can't open %s. Error code %d (%s)\n", __func__,
-                    device_description, errcode, snd_strerror(errcode));
+        if (!(quiet && errcode == -EBUSY))
+            trace_error("%s: can't open %s. Error code %d (%s)\n", __func__,
+                        device_description, errcode, snd_strerror(errcode));
         goto fatal_error;
     }
 
@@ -1237,26 +1247,29 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
               s->buffer_attr.prebuf);
     diag_reset();
 
-    s->state = PA_STREAM_READY;
-    pa_stream_ref(s);
-    s->c->mainloop_api->defer_new(s->c->mainloop_api, deh_stream_state_changed,
-                                  s);
-    pa_stream_ref(s);
-    s->c->mainloop_api->defer_new(s->c->mainloop_api,
-                                  deh_stream_first_readwrite_callback, s);
+    if (s->state != PA_STREAM_READY) {
+        s->state = PA_STREAM_READY;
+        pa_stream_ref(s);
+        s->c->mainloop_api->defer_new(s->c->mainloop_api,
+                                      deh_stream_state_changed, s);
+        pa_stream_ref(s);
+        s->c->mainloop_api->defer_new(
+            s->c->mainloop_api, deh_stream_first_readwrite_callback, s);
+    }
 
     g_free(device_description);
     return 0;
 
 fatal_error:
-    trace_error(
-        "%s: failed to open ALSA device. Apulse does no resampling or format "
-        "conversion, leaving that task to ALSA plugins. Ensure that selected "
-        "device is capable of playing a particular sample format at a "
-        "particular rate. They have to be supported by either hardware "
-        "directly, or by \"plug\" and \"dmix\" ALSA plugins which will perform "
-        "required conversions on CPU.\n",
-        __func__);
+    if (!(quiet && errcode == -EBUSY))
+        trace_error(
+            "%s: failed to open ALSA device. Apulse does no resampling or "
+            "format conversion, leaving that task to ALSA plugins. Ensure that "
+            "selected device is capable of playing a particular sample format "
+            "at a particular rate. They have to be supported by either "
+            "hardware directly, or by \"plug\" and \"dmix\" ALSA plugins which "
+            "will perform required conversions on CPU.\n",
+            __func__);
 
     if (errcode == -EACCES) {
         trace_error(
@@ -1269,7 +1282,7 @@ fatal_error:
     }
 
     g_free(device_description);
-    return -1;
+    return errcode < 0 ? errcode : -1;
 }
 
 APULSE_EXPORT
@@ -1400,62 +1413,96 @@ stream_adjust_buffer_attrs(pa_stream *s, const pa_buffer_attr *attr)
     ba->fragsize = pa_find_multiple_of(ba->fragsize, frame_size, 1);
 }
 
-APULSE_EXPORT
-int
-pa_stream_connect_playback(pa_stream *s, const char *dev,
-                           const pa_buffer_attr *attr, pa_stream_flags_t flags,
-                           const pa_cvolume *volume, pa_stream *sync_stream)
+// ---------------------------------------------------------------------------
+// Device ownership.
+//
+// Upstream apulse corks by writing silence into an open PCM. That is correct
+// on a dmix device, which is what apulse documents. plug:volumio is exclusive:
+// the handle is the lock, and silence still holds it.
+//
+// ALSA has no yield-without-close. snd_pcm_pause and snd_pcm_drop keep the
+// handle; only snd_pcm_close releases the kernel device. A real Pulse server
+// does not close on cork either. It keeps the sink up through cork/flush/uncork
+// (Soloist does that triple on every track change) and module-suspend-on-idle
+// closes the ALSA sink after the sink has been idle, default 5 s.
+//
+// Immediate close-on-cork was the wrong mapping of that. It made every skip
+// a new device instance (hw_ptr back to zero against a held read_index) and
+// it raced the next open against volumioswitch teardown, which is the EBUSY
+// in the journal. The close belongs on the idle timer, after the short cork
+// has either uncorked or stayed corked. Pulse uses 5 s; Volumio starts the
+// next source as soon as the volatile callback returns, so the default here
+// is 150 ms. APULSE_IDLE_RELEASE_MS overrides it.
+//
+// Uncork against a still-open handle is a prepare, not a restart. Uncork
+// after idle close is a new open and must obey the flush contract (indices
+// and clock already reset by the release). If that open is EBUSY, the other
+// source won a handover race: retry with backoff for ~1.5 s, then stay
+// corked. Writes still land in the ring.
+// ---------------------------------------------------------------------------
+
+static void stream_schedule_idle_release(pa_stream *s);
+static void stream_schedule_acquire(pa_stream *s);
+
+static unsigned
+idle_release_ms(void)
 {
-    gchar *s_attr = trace_pa_buffer_attr_as_string(attr);
-    trace_info_f(
-        "P %s s=%p, dev=%s, attr=%s, flags=0x%x, volume=%p, sync_stream=%p\n",
-        __func__, s, dev, s_attr, flags, volume, sync_stream);
-    g_free(s_attr);
+    const char *e = getenv("APULSE_IDLE_RELEASE_MS");
 
-    s->direction = PA_STREAM_PLAYBACK;
-    stream_adjust_buffer_attrs(s, attr);
+    if (e && e[0]) {
+        char *end = NULL;
+        long v = strtol(e, &end, 10);
 
-    if (do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK) < 0)
-        goto err;
-
-    g_atomic_int_set(&s->paused, !!(flags & PA_STREAM_START_CORKED));
-
-    return 0;
-err:
-    return -1;
+        if (end != e && v >= 20 && v <= 5000)
+            return (unsigned)v;
+    }
+    return 150;
 }
 
-// Release the ALSA device without ending the stream.
-//
-// Corking used to keep the device open and write silence into it. That made
-// this plugin hold Volumio's output for the entire Connect session: pausing in
-// the Spotify app, or closing the app altogether, left pcm.volumio open, and
-// MPD could not start until the daemon was killed. The only way out was
-// disabling the plugin.
-//
-// Every other source releases on pause. The bluetooth plugin detaches its
-// transport when idle; librespot closes ALSA when it stops streaming. apulse
-// only ever closed in pa_stream_disconnect, so a corked stream held the device
-// indefinitely.
-//
-// Releasing is not just a close. Closing creates a new device instance on the
-// next open, so hw_ptr in /proc restarts at zero, while read_index is held at
-// its old value by the monotonic rule. fill = write_index - read_index then
-// collapses, writable_size (tlength - fill) goes to zero, and the client stops
-// writing: observed as a burst of the stale ring, the seek bar advancing on the
-// interpolated clock and then stalling, and no audio until a track change.
-//
-// A track change is pa_stream_flush, and that path works. So this does exactly
-// what flush does: discard the ring, zero the indices, reset the clock. The
-// device and our accounting restart together, which is the only state in which
-// they can agree.
+static void
+timeval_add_ms(struct timeval *tv, unsigned ms)
+{
+    tv->tv_usec += (long)ms * 1000;
+    tv->tv_sec += tv->tv_usec / 1000000;
+    tv->tv_usec %= 1000000;
+}
+
+static void
+stream_cancel_time(pa_stream *s, pa_time_event **ev)
+{
+    pa_mainloop_api *api;
+
+    if (!s || !ev || !*ev)
+        return;
+    api = s->c->mainloop_api;
+    if (api && api->time_free)
+        api->time_free(*ev);
+    *ev = NULL;
+}
+
+static pa_time_event *
+stream_after_ms(pa_stream *s, unsigned ms, pa_time_event_cb_t cb)
+{
+    pa_mainloop_api *api;
+    struct timeval tv;
+
+    if (!s || !s->c || !cb)
+        return NULL;
+    api = s->c->mainloop_api;
+    if (!api || !api->time_new)
+        return NULL;
+    gettimeofday(&tv, NULL);
+    timeval_add_ms(&tv, ms);
+    return api->time_new(api, &tv, cb, s);
+}
+
 static void
 stream_release_device(pa_stream *s)
 {
     if (!s->ph)
         return;
 
-    diag_logf("release device on cork: rb=%zu",
+    diag_logf("release device: rb=%zu",
               s->rb ? ringbuffer_readable_size(s->rb) : 0);
 
     for (int k = 0; k < s->nioe; k++) {
@@ -1472,7 +1519,6 @@ stream_release_device(pa_stream *s)
     snd_pcm_close(s->ph);
     s->ph = NULL;
 
-    // The flush contract, for the reasons above.
     if (s->rb)
         ringbuffer_drop(s->rb, ringbuffer_readable_size(s->rb));
     s->timing_info.write_index = 0;
@@ -1481,61 +1527,186 @@ stream_release_device(pa_stream *s)
     stream_clock_reset(s);
 }
 
-// Take the device back on uncork. do_connect_pcm renegotiates and rebuilds the
-// io events, which is the same path a new stream takes.
-//
-// Output stays disabled until the client writes, again matching flush: the ring
-// is empty by definition here, so enabling POLLOUT would only spin. The flow
-// control in pa_stream_write restores it when there is something to send.
 static int
 stream_acquire_device(pa_stream *s)
 {
     if (s->ph)
         return 0;
 
-    if (do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK) < 0) {
-        // Another source owns the chain. Observed at handover, before the
-        // plugin learned to send deactivate: volumioswitch could not open
-        // volumioLocalPlayback and this retried for as long as the client kept
-        // asking.
-        //
-        // Stay corked and say so once. The client is not playing, and
-        // pretending otherwise is what produced a transport that showed
-        // playing with the device in someone else's hands.
+    if (do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK, s->acquire_attempts > 0) <
+        0) {
         if (!s->acquire_failed) {
             s->acquire_failed = 1;
-            diag_logf("reacquire device on uncork FAILED: device busy, "
-                      "staying corked");
+            diag_logf("reacquire device FAILED: device busy");
         }
         return -1;
     }
     s->acquire_failed = 0;
+    s->acquire_attempts = 0;
 
     stream_set_output_enabled(s, 0);
-    diag_logf("reacquired device on uncork");
+    diag_logf("reacquired device");
+    return 0;
+}
+
+static void
+stream_become_running(pa_stream *s)
+{
+    if (s->clock_have_origin || s->clock_frozen_usec)
+        stream_clock_start(s);
+    g_atomic_int_set(&s->paused, 0);
+    stream_wake_output(s);
+}
+
+static void
+stream_idle_release_cb(pa_mainloop_api *a, pa_time_event *e,
+                       const struct timeval *tv, void *userdata)
+{
+    pa_stream *s = userdata;
+
+    (void)tv;
+    s->idle_ev = NULL;
+    if (a && a->time_free)
+        a->time_free(e);
+    if (s->want_running || !g_atomic_int_get(&s->paused))
+        return;
+    stream_release_device(s);
+}
+
+static void
+stream_schedule_idle_release(pa_stream *s)
+{
+    stream_cancel_time(s, &s->idle_ev);
+    s->idle_ev = stream_after_ms(s, idle_release_ms(), stream_idle_release_cb);
+    if (!s->idle_ev)
+        stream_release_device(s);
+}
+
+static void
+stream_acquire_retry_cb(pa_mainloop_api *a, pa_time_event *e,
+                        const struct timeval *tv, void *userdata)
+{
+    pa_stream *s = userdata;
+
+    (void)tv;
+    s->acquire_ev = NULL;
+    if (a && a->time_free)
+        a->time_free(e);
+    if (!s->want_running)
+        return;
+    if (stream_acquire_device(s) == 0) {
+        stream_become_running(s);
+        return;
+    }
+    stream_schedule_acquire(s);
+}
+
+static void
+stream_schedule_acquire(pa_stream *s)
+{
+    static const unsigned backoff_ms[] = {50, 100, 200, 400, 800};
+    unsigned i = (unsigned)s->acquire_attempts;
+    unsigned ms;
+
+    if (i >= G_N_ELEMENTS(backoff_ms)) {
+        if (!s->acquire_failed) {
+            s->acquire_failed = 1;
+            diag_logf("reacquire gave up: device busy, staying corked");
+        }
+        return;
+    }
+    ms = backoff_ms[i];
+    s->acquire_attempts = (int)i + 1;
+    stream_cancel_time(s, &s->acquire_ev);
+    s->acquire_ev = stream_after_ms(s, ms, stream_acquire_retry_cb);
+    if (!s->acquire_ev && !s->acquire_failed) {
+        s->acquire_failed = 1;
+        diag_logf("reacquire failed, no timer, staying corked");
+    }
+}
+
+APULSE_EXPORT
+int
+pa_stream_connect_playback(pa_stream *s, const char *dev,
+                           const pa_buffer_attr *attr, pa_stream_flags_t flags,
+                           const pa_cvolume *volume, pa_stream *sync_stream)
+{
+    gchar *s_attr = trace_pa_buffer_attr_as_string(attr);
+    trace_info_f(
+        "P %s s=%p, dev=%s, attr=%s, flags=0x%x, volume=%p, sync_stream=%p\n",
+        __func__, s, dev, s_attr, flags, volume, sync_stream);
+    g_free(s_attr);
+
+    s->direction = PA_STREAM_PLAYBACK;
+    stream_adjust_buffer_attrs(s, attr);
+
+    {
+        int err = do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK, 0);
+        int start_corked = !!(flags & PA_STREAM_START_CORKED);
+
+        g_atomic_int_set(&s->paused, start_corked);
+        s->want_running = !start_corked;
+
+        if (err < 0) {
+            // The Pulse stream exists without a device. A real server does
+            // the same when the sink is suspended. Volumio handover races
+            // this open against MPD; failing the connect made Soloist retry
+            // do_connect_pcm indefinitely and log EBUSY every time.
+            g_atomic_int_set(&s->paused, 1);
+            if (s->state != PA_STREAM_READY) {
+                s->state = PA_STREAM_READY;
+                pa_stream_ref(s);
+                s->c->mainloop_api->defer_new(s->c->mainloop_api,
+                                              deh_stream_state_changed, s);
+                pa_stream_ref(s);
+                s->c->mainloop_api->defer_new(
+                    s->c->mainloop_api, deh_stream_first_readwrite_callback,
+                    s);
+            }
+            if (!start_corked)
+                stream_schedule_acquire(s);
+            return 0;
+        }
+
+        if (start_corked)
+            stream_schedule_idle_release(s);
+    }
+
     return 0;
 }
 
 static void
 pa_stream_cork_impl(pa_operation *op)
 {
+    pa_stream *s = op->s;
+
     diag_logf("cork %d", op->int_arg_1 ? 1 : 0);
     if (op->int_arg_1) {
-        stream_clock_freeze(op->s);
-        g_atomic_int_set(&op->s->paused, 1);
-        // Give the device up so anything else on the system can use it.
-        stream_release_device(op->s);
+        stream_cancel_time(s, &s->acquire_ev);
+        s->acquire_attempts = 0;
+        s->want_running = 0;
+        stream_clock_freeze(s);
+        g_atomic_int_set(&s->paused, 1);
+        if (s->ph) {
+            snd_pcm_drop(s->ph);
+            stream_set_output_enabled(s, 0);
+        }
+        stream_schedule_idle_release(s);
     } else {
-        if (stream_acquire_device(op->s) == 0) {
-            if (op->s->clock_have_origin || op->s->clock_frozen_usec)
-                stream_clock_start(op->s);
-            g_atomic_int_set(&op->s->paused, 0);
-            stream_wake_output(op->s);
+        stream_cancel_time(s, &s->idle_ev);
+        s->want_running = 1;
+        if (s->ph) {
+            snd_pcm_prepare(s->ph);
+            stream_become_running(s);
+        } else if (stream_acquire_device(s) == 0) {
+            stream_become_running(s);
+        } else {
+            stream_schedule_acquire(s);
         }
     }
 
     if (op->stream_success_cb)
-        op->stream_success_cb(op->s, 1, op->cb_userdata);
+        op->stream_success_cb(s, 1, op->cb_userdata);
 
     pa_operation_done(op);
 }
@@ -1566,6 +1737,9 @@ pa_stream_disconnect(pa_stream *s)
 
     if (s->state != PA_STREAM_READY)
         return PA_ERR_BADSTATE;
+
+    stream_cancel_time(s, &s->idle_ev);
+    stream_cancel_time(s, &s->acquire_ev);
 
     // Logged before the close so the state ALSA is being left in is visible.
     // Upstream closes without dropping first, so a running stream with a full
@@ -2277,6 +2451,8 @@ pa_stream_unref(pa_stream *s)
     if (s->ref_cnt == 0) {
         pa_context *c = s->c;
 
+        stream_cancel_time(s, &s->idle_ev);
+        stream_cancel_time(s, &s->acquire_ev);
         g_hash_table_remove(s->c->streams_ht, GINT_TO_POINTER(s->idx));
         ringbuffer_free(s->rb);
         free(s->peek_buffer);
@@ -2447,7 +2623,7 @@ pa_stream_connect_record(pa_stream *s, const char *dev,
     s->direction = PA_STREAM_RECORD;
     stream_adjust_buffer_attrs(s, attr);
 
-    if (do_connect_pcm(s, SND_PCM_STREAM_CAPTURE) < 0)
+    if (do_connect_pcm(s, SND_PCM_STREAM_CAPTURE, 0) < 0)
         goto err;
 
     snd_pcm_start(s->ph);

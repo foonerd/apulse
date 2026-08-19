@@ -148,8 +148,16 @@ struct pa_stream {
     // Duration of the ALSA buffer actually opened, reported to the client as
     // configured_sink_usec so it knows what pipeline it is feeding.
     pa_usec_t configured_sink_usec;
+    // Last cork request from the client. Uncork sets it; a failed reacquire
+    // leaves it set so the backoff timer can keep trying.
+    int want_running;
+    // Cork idle-release and EBUSY-retry timers. Both are Pulse mainloop
+    // time events; NULL when idle. Must be freed before the stream is.
+    pa_time_event *idle_ev;
+    pa_time_event *acquire_ev;
+    int acquire_attempts;
     // Set when a reacquire on uncork found the chain owned by another source,
-    // so the failure is logged once rather than on every attempt.
+    // so the open error is logged once rather than on every attempt.
     int acquire_failed;
 };
 
