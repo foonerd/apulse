@@ -136,6 +136,9 @@ struct pa_stream {
     int clock_have_path;
     int clock_logged;
     char clock_status_path[576];
+    // Duration of the ALSA buffer actually opened, reported to the client as
+    // configured_sink_usec so it knows what pipeline it is feeding.
+    pa_usec_t configured_sink_usec;
 };
 
 struct pa_operation {

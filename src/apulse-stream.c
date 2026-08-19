@@ -1028,6 +1028,10 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
     s->out_enabled = 1;
     free(fds);
 
+    if (stream_direction == SND_PCM_STREAM_PLAYBACK && s->ss.rate > 0)
+        s->configured_sink_usec =
+            (pa_usec_t)((uint64_t)buffer_size * 1000000ULL / s->ss.rate);
+
     diag_logf("connect %s: pulse %s %u Hz %u ch frame=%zu | alsa %s period=%lu "
               "buffer=%lu periods=%lu.%02lu fds=%d | tlength=%u minreq=%u "
               "prebuf=%u",
@@ -1634,20 +1638,42 @@ static void
 stream_update_timing(pa_stream *s)
 {
     const size_t frame_size = pa_frame_size(&s->ss);
+    pa_usec_t hw_usec;
     int64_t played;
 
     gettimeofday(&s->timing_info.timestamp, NULL);
 
-    played = (int64_t)pa_usec_to_bytes(stream_hw_time(s), &s->ss);
+    hw_usec = stream_hw_time(s);
+    played = (int64_t)pa_usec_to_bytes(hw_usec, &s->ss);
     if (frame_size > 0)
         played -= played % (int64_t)frame_size;
-    if (played < 0)
-        played = 0;
 
-    // The hardware cannot have played more than the client wrote. It can look
-    // that way for a moment at startup, before the clock origin settles.
+    // read_index is monotonic. The hardware never un-plays audio, so a lower
+    // answer means our clock lost its position, not that the DAC went
+    // backwards: before the first write, while corked, and after a flush
+    // resets the origin, stream_hw_time legitimately returns 0.
+    //
+    // Reporting that 0 was a real defect. Observed on device:
+    //
+    //   r=14013064  fill=236168     playing=1
+    //   r=0         fill=14249232   playing=0
+    //
+    // The fill level jumped from 236 KB to 14 MB in 29 us. Soloist polls
+    // timing about ten times per write and interpolates between polls, so a
+    // step of that size is not a glitch it can ignore; it is a backlog
+    // fourteen million bytes deep appearing between two reads.
+    //
+    // Hold the previous value instead. A position that stops advancing is
+    // honest about a clock that has stopped; a position that collapses to zero
+    // is not.
+    if (played < s->timing_info.read_index)
+        played = s->timing_info.read_index;
+
+    // The hardware cannot have played more than the client wrote.
     if (played > s->timing_info.write_index)
         played = s->timing_info.write_index;
+    if (played < 0)
+        played = 0;
 
     s->timing_info.read_index = played;
     s->timing_info.read_index_corrupt = 0;
@@ -1659,6 +1685,12 @@ stream_update_timing(pa_stream *s)
     // would double-count the same audio.
     s->timing_info.sink_usec = 0;
     s->timing_info.transport_usec = 0;
+
+    // Describe the pipeline being fed. This was left at 0, so the client had no
+    // idea what buffer it was writing into. configured_sink_usec is set from
+    // the ALSA buffer actually opened, in do_connect_pcm.
+    if (s->configured_sink_usec)
+        s->timing_info.configured_sink_usec = s->configured_sink_usec;
 }
 
 APULSE_EXPORT
