@@ -58,7 +58,24 @@ diag_on(void)
     if (cached < 0) {
         const char *e = getenv("APULSE_DIAG");
 
-        cached = (e && e[0] == '1') ? 1 : 0;
+        cached = (e && (e[0] == '1' || e[0] == '2')) ? 1 : 0;
+    }
+    return cached;
+}
+
+// APULSE_DIAG=2 removes the rate limits. Intended for a trace capture, where
+// every timing read has to be visible next to the upstream trace line for the
+// call that produced it. One in ten is enough to see the shape of a steady
+// state; it is not enough to correlate two logs event by event.
+static int
+diag_full(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *e = getenv("APULSE_DIAG");
+
+        cached = (e && e[0] == '2') ? 1 : 0;
     }
     return cached;
 }
@@ -1560,9 +1577,9 @@ diag_timing_read(pa_stream *s, const char *how)
     tstat.last_read = now;
 
     // Every field of the struct, because which ones the client uses is exactly
-    // what is unknown. Rate-limited to one line in ten to keep the journal
-    // readable while still showing the shape.
-    if ((tstat.reads + tstat.updates) % 10 == 0)
+    // what is unknown. One line in ten by default to keep the journal readable;
+    // APULSE_DIAG=2 logs every read, which is what a trace capture needs.
+    if (diag_full() || (tstat.reads + tstat.updates) % 10 == 0)
         diag_logf("timing[%s] gap=%ldus w=%lld r=%lld fill=%lld "
                   "sink=%llu transport=%llu cfg_sink=%llu since_underrun=%llu "
                   "playing=%d ts=%ld.%06ld",
