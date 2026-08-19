@@ -136,6 +136,12 @@ struct pa_stream {
     int clock_have_path;
     int clock_logged;
     char clock_status_path[576];
+    // Interpolation between period boundaries. hw_ptr advances once per period,
+    // so a client sampling faster than that sees a staircase. These record when
+    // hw_ptr last changed and by how much, so the position can be estimated
+    // between steps.
+    struct timeval clock_step_at;
+    int64_t clock_step_frames;
     // Duration of the ALSA buffer actually opened, reported to the client as
     // configured_sink_usec so it knows what pipeline it is feeding.
     pa_usec_t configured_sink_usec;
