@@ -1425,18 +1425,80 @@ err:
     return -1;
 }
 
+// Release the ALSA device without ending the stream.
+//
+// Corking used to keep the device open and write silence into it. That made
+// this plugin hold Volumio's output for the entire Connect session: pausing in
+// the Spotify app, or closing the app altogether, left pcm.volumio open, and
+// MPD could not start until the daemon was killed. The only way out was
+// disabling the plugin.
+//
+// Every other source releases on pause. The bluetooth plugin detaches its
+// transport when idle; librespot closes ALSA when it stops streaming. apulse
+// only ever closed in pa_stream_disconnect, so a corked stream held the device
+// indefinitely.
+//
+// The io events go first, as in pa_stream_disconnect, so the callback cannot
+// fire against a closed handle. The ring is kept: it holds audio the client
+// wrote but the DAC has not played, and that is still the right audio to send
+// when playback resumes.
+static void
+stream_release_device(pa_stream *s)
+{
+    if (!s->ph)
+        return;
+
+    diag_logf("release device on cork: rb=%zu",
+              s->rb ? ringbuffer_readable_size(s->rb) : 0);
+
+    for (int k = 0; k < s->nioe; k++) {
+        pa_mainloop_api *api = s->c->mainloop_api;
+
+        api->io_free(s->ioe[k]);
+    }
+    free(s->ioe);
+    s->ioe = NULL;
+    s->nioe = 0;
+    s->out_enabled = 0;
+
+    snd_pcm_drop(s->ph);
+    snd_pcm_close(s->ph);
+    s->ph = NULL;
+}
+
+// Take the device back on uncork. do_connect_pcm renegotiates and rebuilds the
+// io events, which is the same path a new stream takes, so resuming is exactly
+// a fresh connect with the ring already primed.
+static int
+stream_acquire_device(pa_stream *s)
+{
+    if (s->ph)
+        return 0;
+
+    if (do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK) < 0) {
+        diag_logf("reacquire device on uncork FAILED");
+        return -1;
+    }
+    return 0;
+}
+
 static void
 pa_stream_cork_impl(pa_operation *op)
 {
     diag_logf("cork %d", op->int_arg_1 ? 1 : 0);
-    if (op->int_arg_1)
+    if (op->int_arg_1) {
         stream_clock_freeze(op->s);
-    else if (op->s->clock_have_origin || op->s->clock_frozen_usec)
-        stream_clock_start(op->s);
-    g_atomic_int_set(&op->s->paused, !!(op->int_arg_1));
-    // Corked still writes silence to hold the device, and uncorked has audio to
-    // send, so either transition needs the output events active.
-    stream_wake_output(op->s);
+        g_atomic_int_set(&op->s->paused, 1);
+        // Give the device up so anything else on the system can use it.
+        stream_release_device(op->s);
+    } else {
+        if (stream_acquire_device(op->s) == 0) {
+            if (op->s->clock_have_origin || op->s->clock_frozen_usec)
+                stream_clock_start(op->s);
+            g_atomic_int_set(&op->s->paused, 0);
+            stream_wake_output(op->s);
+        }
+    }
 
     if (op->stream_success_cb)
         op->stream_success_cb(op->s, 1, op->cb_userdata);
