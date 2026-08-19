@@ -554,6 +554,27 @@ stream_adjust_buffer_attrs(pa_stream *s, const pa_buffer_attr *attr)
 
     ba->tlength = MIN(ba->tlength, ba->maxlength);
 
+    // Cap the target buffer length when APULSE_MAX_TLENGTH_MS is set.
+    //
+    // On Volumio the chain runs through the volumioswitch ioplug, which keeps
+    // its own buffer and separately sizes the buffer of its target PCM from
+    // io->buffer_size. Both stages derive from tlength, so the default lands
+    // twice in series.
+    //
+    // Applied after defaulting and before minreq and prebuf are derived, so
+    // those stay consistent with the capped value.
+    {
+        const char *max_tlength_ms = getenv("APULSE_MAX_TLENGTH_MS");
+        long ms = max_tlength_ms ? strtol(max_tlength_ms, NULL, 10) : 0;
+
+        if (ms > 0) {
+            size_t cap = pa_usec_to_bytes((pa_usec_t)ms * 1000, &s->ss);
+
+            if (cap >= frame_size && ba->tlength > cap)
+                ba->tlength = cap;
+        }
+    }
+
     // Minimum request (playback).
     if (ba->minreq == (uint32_t)-1) {
         ba->minreq = pa_usec_to_bytes(20 * 1000, &s->ss);
@@ -562,6 +583,11 @@ stream_adjust_buffer_attrs(pa_stream *s, const pa_buffer_attr *attr)
 
     if (ba->minreq == 0)
         ba->minreq = frame_size;
+
+    // Keep at least four requests per buffer, including when the client set
+    // minreq explicitly and the cap above shrank tlength underneath it.
+    if (ba->minreq > ba->tlength / 4 && ba->tlength / 4 >= frame_size)
+        ba->minreq = ba->tlength / 4;
 
     // Fragment size (recording).
     if (ba->fragsize == (uint32_t)-1) {
@@ -724,19 +750,65 @@ pa_stream_get_index(pa_stream *s)
     return s->idx;
 }
 
+// volumioswitch reports delay = local + target. That figure can sit at
+// the ioplug maximum (65536 frames, ~1.48 s at 44100) even when the
+// client asked for a few hundred milliseconds. Soloist uses Pulse
+// latency to steer playback speed. A 1.5 s report makes it rush, then
+// stall, then chop.
+//
+// Cap the number we hand back to the requested tlength, or to
+// APULSE_MAX_TLENGTH_MS if that is set and smaller. Does not change
+// ALSA rate, format, or buffer negotiation.
+static snd_pcm_sframes_t
+stream_reported_delay(pa_stream *s)
+{
+    snd_pcm_sframes_t delay = 0;
+    const size_t frame_size = pa_frame_size(&s->ss);
+    snd_pcm_sframes_t cap = 0;
+
+    if (s->ph && snd_pcm_delay(s->ph, &delay) < 0)
+        delay = 0;
+    if (delay < 0)
+        delay = 0;
+
+    if (frame_size > 0 && s->buffer_attr.tlength > 0 &&
+        s->buffer_attr.tlength != (uint32_t)-1)
+        cap = (snd_pcm_sframes_t)(s->buffer_attr.tlength / frame_size);
+
+    {
+        const char *max_tlength_ms = getenv("APULSE_MAX_TLENGTH_MS");
+        long ms = max_tlength_ms ? strtol(max_tlength_ms, NULL, 10) : 0;
+
+        if (ms > 0 && s->ss.rate > 0) {
+            snd_pcm_sframes_t env_cap =
+                (snd_pcm_sframes_t)((int64_t)s->ss.rate * ms / 1000);
+
+            if (env_cap > 0 && (cap <= 0 || env_cap < cap))
+                cap = env_cap;
+        }
+    }
+
+    if (cap > 0 && delay > cap)
+        delay = cap;
+
+    return delay;
+}
+
 APULSE_EXPORT
 int
 pa_stream_get_latency(pa_stream *s, pa_usec_t *r_usec, int *negative)
 {
     trace_info_f("F %s s=%p\n", __func__, s);
 
-    snd_pcm_sframes_t delay;
+    snd_pcm_sframes_t delay = stream_reported_delay(s);
 
-    if (snd_pcm_delay(s->ph, &delay) < 0)
-        delay = 0;
+    if (r_usec) {
+        size_t frame_size = pa_frame_size(&s->ss);
 
-    if (r_usec)
-        *r_usec = 1000 * 1000 * delay / s->ss.rate;
+        *r_usec = frame_size > 0
+                      ? pa_bytes_to_usec((uint64_t)delay * frame_size, &s->ss)
+                      : 0;
+    }
     if (negative)
         *negative = 0;
     return 0;
@@ -781,10 +853,8 @@ pa_stream_get_timing_info(pa_stream *s)
 {
     trace_info_f("F %s s=%p\n", __func__, s);
 
-    snd_pcm_sframes_t delay;
+    snd_pcm_sframes_t delay = stream_reported_delay(s);
 
-    if (snd_pcm_delay(s->ph, &delay) < 0)
-        delay = 0;
     s->timing_info.read_index =
         s->timing_info.write_index - delay * pa_frame_size(&s->ss);
 
