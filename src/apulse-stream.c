@@ -953,6 +953,11 @@ pa_stream_new_with_proplist(pa_context *c, const char *name,
     s->state = PA_STREAM_UNCONNECTED;
     s->ss = *ss;
 
+    // The stream dereferences s->c throughout its lifetime, including in
+    // pa_stream_unref after the client may already have dropped its own
+    // reference. Own the context rather than borrowing it.
+    pa_context_ref(c);
+
     s->idx = c->next_stream_idx++;
     g_hash_table_insert(c->streams_ht, GINT_TO_POINTER(s->idx), s);
 
@@ -1089,12 +1094,19 @@ pa_stream_unref(pa_stream *s)
 
     s->ref_cnt--;
     if (s->ref_cnt == 0) {
+        pa_context *c = s->c;
+
         g_hash_table_remove(s->c->streams_ht, GINT_TO_POINTER(s->idx));
         ringbuffer_free(s->rb);
         free(s->peek_buffer);
         free(s->write_buffer);
         free(s->name);
         free(s);
+
+        // Released only after the stream has removed itself from the table, so
+        // the table is still alive above even when this drops the last
+        // reference and frees the context.
+        pa_context_unref(c);
     }
 }
 
