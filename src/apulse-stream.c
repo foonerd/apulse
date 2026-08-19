@@ -2017,7 +2017,27 @@ pa_stream_new_with_proplist(pa_context *c, const char *name,
     s->timing_info.configured_source_usec = 0;
     s->timing_info.since_underrun = 0;
 
-    s->rb = ringbuffer_new(72 * 1024);  // TODO: figure out size
+    // Size the ring in TIME, not bytes.
+    //
+    // 72 KiB is 418 ms of S16 stereo but only 209 ms of FLOAT32 stereo. Soloist
+    // decodes lossy to S16 and lossless to FLOAT32, so the same constant gives
+    // lossless half the buffer, and it writes 93 ms per call rather than 46.
+    // That is why the fault is lossless-only.
+    //
+    // Sized from tlength, which is what the client was told the target is, with
+    // headroom for one write on top. Floored at the historic 72 KiB.
+    {
+        size_t fs = pa_frame_size(&s->ss);
+        size_t rb_bytes = 72 * 1024;
+
+        if (fs > 0 && s->ss.rate > 0) {
+            // 500 ms at the client's own frame size.
+            rb_bytes = fs * (size_t)((uint64_t)s->ss.rate / 2);
+            if (rb_bytes < 72 * 1024)
+                rb_bytes = 72 * 1024;
+        }
+        s->rb = ringbuffer_new(rb_bytes);
+    }
     s->peek_buffer = malloc(s->rb->end - s->rb->start);
 
     for (uint32_t k = 0; k < PA_CHANNELS_MAX; k++)
@@ -2206,6 +2226,32 @@ pa_stream_writable_size(pa_stream *s)
 
     if (writable_size < limit)
         writable_size = 0;
+
+    // Bound by tlength, as a real PulseAudio server does.
+    //
+    // Without this, writable_size reports the whole ring and the client keeps
+    // writing until the ring is full rather than until the target is met.
+    // Measured on device at lossless: Soloist supplied 1.234x realtime, writing
+    // 93 ms of audio every 98 ms at the median but 43% of writes arriving
+    // faster than that, 4% under 10 ms apart. It filled the ring, hit a zero
+    // answer, stalled, then burst again. That alternation is the speeding up
+    // and slowing down.
+    //
+    // tlength is the target the client was told about, so it is the level to
+    // hold. Room = target minus what is already queued.
+    if (s->buffer_attr.tlength > 0 &&
+        s->buffer_attr.tlength != (uint32_t)-1) {
+        int64_t fill = s->timing_info.write_index - s->timing_info.read_index;
+        int64_t room;
+
+        if (fill < 0)
+            fill = 0;
+        room = (int64_t)s->buffer_attr.tlength - fill;
+        if (room < 0)
+            room = 0;
+        if ((size_t)room < writable_size)
+            writable_size = (size_t)room;
+    }
 
     {
         size_t out = pa_find_multiple_of(writable_size, pa_frame_size(&s->ss), 0);
