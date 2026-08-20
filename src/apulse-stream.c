@@ -799,6 +799,8 @@ stream_set_output_enabled(pa_stream *s, int enable)
 // Called from pa_stream_write and from cork, both of which mean the stream may
 // have something to send again.
 static int stream_maybe_yield(pa_stream *s);
+static void stream_release_device(pa_stream *s, int keep_position);
+static void stream_schedule_acquire(pa_stream *s);
 
 static void
 stream_wake_output(pa_stream *s)
@@ -915,9 +917,14 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
 #endif
 
             if (frame_count < 0) {
-                trace_error(
-                    "%s, can't recover after failed snd_pcm_avail (%d)\n",
-                    __func__, (int)frame_count);
+                // volumioswitch can return EPIPE from a stale target while the
+                // switcher handle stays open. recover/prepare does not reopen
+                // that target; only close + snd_pcm_open does.
+                diag_logf("pcm unrecovered (%ld), reopening",
+                          (long)frame_count);
+                stream_release_device(s, 1);
+                if (s->want_running)
+                    stream_schedule_acquire(s);
                 return;
             }
         }
@@ -934,6 +941,13 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
 
             memset(buf, 0, bytecnt);
             wr = snd_pcm_writei(s->ph, buf, bytecnt / frame_size);
+            if (wr < 0 && wr != -EAGAIN) {
+                diag_logf("writei failed (%ld), reopening", (long)wr);
+                stream_release_device(s, 1);
+                if (s->want_running)
+                    stream_schedule_acquire(s);
+                return;
+            }
             diag_note_write(wr, bytecnt / frame_size, 1);
         } else {
             size_t writable_size = pa_stream_writable_size(s);
@@ -959,6 +973,13 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
                 return;
             }
             wr = snd_pcm_writei(s->ph, buf, bytecnt / frame_size);
+            if (wr < 0 && wr != -EAGAIN) {
+                diag_logf("writei failed (%ld), reopening", (long)wr);
+                stream_release_device(s, 1);
+                if (s->want_running)
+                    stream_schedule_acquire(s);
+                return;
+            }
             if (wr > 0)
                 stream_clock_start(s);
             diag_note_write(wr, bytecnt / frame_size, 0);
@@ -1578,11 +1599,8 @@ stream_maybe_yield(pa_stream *s)
     diag_logf("yield: releasing device");
     stream_cancel_time(s, &s->acquire_ev);
     s->acquire_attempts = 0;
-    s->want_running = 0;
     stream_clock_freeze(s);
-    g_atomic_int_set(&s->paused, 1);
     stream_release_device(s, 1);
-    unlink(yield_path());
     return 1;
 }
 
@@ -1591,6 +1609,9 @@ stream_acquire_device(pa_stream *s)
 {
     if (s->ph)
         return 0;
+
+    if (yield_requested())
+        return -1;
 
     if (do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK) < 0) {
         if (!s->acquire_failed) {
@@ -1652,9 +1673,19 @@ static void
 stream_schedule_acquire(pa_stream *s)
 {
     static const unsigned backoff_ms[] = {50, 100, 200, 400, 800};
-    unsigned i = (unsigned)s->acquire_attempts;
-    unsigned last = G_N_ELEMENTS(backoff_ms) - 1;
-    unsigned ms = (i > last) ? backoff_ms[last] : backoff_ms[i];
+    unsigned i;
+    unsigned last;
+    unsigned ms;
+
+    if (yield_requested()) {
+        stream_cancel_time(s, &s->acquire_ev);
+        s->acquire_ev = stream_after_ms(s, 50, stream_acquire_retry_cb);
+        return;
+    }
+
+    i = (unsigned)s->acquire_attempts;
+    last = G_N_ELEMENTS(backoff_ms) - 1;
+    ms = (i > last) ? backoff_ms[last] : backoff_ms[i];
 
     if (i <= last)
         s->acquire_attempts = (int)i + 1;
@@ -1686,7 +1717,9 @@ pa_stream_connect_playback(pa_stream *s, const char *dev,
     stream_adjust_buffer_attrs(s, attr);
 
     {
-        int err = do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK);
+        int err = yield_requested()
+                      ? -1
+                      : do_connect_pcm(s, SND_PCM_STREAM_PLAYBACK);
         int start_corked = !!(flags & PA_STREAM_START_CORKED);
 
         g_atomic_int_set(&s->paused, start_corked);
