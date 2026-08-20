@@ -25,7 +25,9 @@
 #include "trace.h"
 #include "util.h"
 
+#include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 // APULSE_EXTERNAL_VOLUME=1: keep sink-input volume for the Pulse API, do
 // not scale samples. Volumio's SoftMaster is the mixer; scaling here sits
@@ -197,6 +199,89 @@ pa_apply_volume_multiplier(void *buf, size_t sz,
     default:
         trace_error("format %s is not implemented in %s\n",
                     pa_sample_format_to_string(ss->format), __func__);
+        break;
+    }
+}
+
+static float
+output_trim_gain(void)
+{
+    static float gain = -1.f;
+
+    if (gain < 0.f) {
+        const char *e = getenv("APULSE_OUTPUT_TRIM_DB");
+        char *end = NULL;
+        long db = e ? strtol(e, &end, 10) : 0;
+
+        if (!e || end == e || *end != '\0' || db == 0) {
+            gain = 1.f;
+        } else {
+            if (db > 12)
+                db = 12;
+            if (db < -12)
+                db = -12;
+            gain = powf(10.f, (float)db / 20.f);
+        }
+    }
+    return gain;
+}
+
+void
+pa_apply_output_trim(void *buf, size_t sz, const pa_sample_spec *ss)
+{
+    char *p;
+    char *last;
+    uint32_t channels;
+    float g;
+
+    if (!buf || !ss || sz == 0)
+        return;
+
+    g = output_trim_gain();
+    if (g == 1.f)
+        return;
+
+    channels = MIN(ss->channels, PA_CHANNELS_MAX);
+    if (channels == 0)
+        return;
+
+    p = buf;
+    last = p + sz;
+
+    switch (ss->format) {
+    case PA_SAMPLE_FLOAT32NE:
+        while (p < last) {
+            uint32_t k;
+
+            for (k = 0; k < channels && p < last; k++) {
+                float sample;
+
+                memcpy(&sample, p, sizeof(sample));
+                sample *= g;
+                memcpy(p, &sample, sizeof(sample));
+                p += sizeof(sample);
+            }
+        }
+        break;
+
+    case PA_SAMPLE_S16NE:
+        while (p < last) {
+            uint32_t k;
+
+            for (k = 0; k < channels && p < last; k++) {
+                int16_t sample;
+                float sample_scaled;
+
+                memcpy(&sample, p, sizeof(sample));
+                sample_scaled = sample * g;
+                sample = CLAMP(sample_scaled, -32768.0, 32767.0);
+                memcpy(p, &sample, sizeof(sample));
+                p += sizeof(sample);
+            }
+        }
+        break;
+
+    default:
         break;
     }
 }

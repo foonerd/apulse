@@ -43,3 +43,6 @@ void
 pa_apply_volume_multiplier(void *buf, size_t sz,
                            const pa_volume_t volume[PA_CHANNELS_MAX],
                            const pa_sample_spec *ss);
+
+void
+pa_apply_output_trim(void *buf, size_t sz, const pa_sample_spec *ss);

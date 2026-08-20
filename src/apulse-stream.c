@@ -961,6 +961,7 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
             bytecnt = ringbuffer_read(s->rb, buf, bytecnt);
 
             pa_apply_volume_multiplier(buf, bytecnt, s->volume, &s->ss);
+            pa_apply_output_trim(buf, bytecnt, &s->ss);
 
             snd_pcm_sframes_t wr;
 
