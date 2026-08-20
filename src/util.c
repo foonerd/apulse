@@ -25,6 +25,24 @@
 #include "trace.h"
 #include "util.h"
 
+#include <stdlib.h>
+
+// APULSE_EXTERNAL_VOLUME=1: keep sink-input volume for the Pulse API, do
+// not scale samples. Volumio's SoftMaster is the mixer; scaling here sits
+// in front of peppyalsa.
+static int
+external_volume(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *e = getenv("APULSE_EXTERNAL_VOLUME");
+
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 int
 pa_format_to_alsa(pa_sample_format_t format)
 {
@@ -120,6 +138,10 @@ pa_apply_volume_multiplier(void *buf, size_t sz,
 
     if (channels == 0) {
         // No channels — nothing to scale.
+        return;
+    }
+
+    if (external_volume()) {
         return;
     }
 
