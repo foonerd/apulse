@@ -3,6 +3,7 @@ add_custom_target(check COMMAND "${CMAKE_CTEST_COMMAND}")
 
 set(test_list
     test_ringbuffer
+    test_convert
 )
 link_directories(${REQ_LIBRARY_DIRS})
 

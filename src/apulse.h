@@ -148,6 +148,17 @@ struct pa_stream {
     // Duration of the ALSA buffer actually opened, reported to the client as
     // configured_sink_usec so it knows what pipeline it is feeding.
     pa_usec_t configured_sink_usec;
+    // Device format and period are independent of the Pulse spec. Playback
+    // converts into the chain-native format (S24_3LE on Volumio) and writes
+    // one hardware period per wakeup. Pulse tlength/minreq still pace the
+    // client; they are not the ALSA period.
+    snd_pcm_format_t alsa_format;
+    size_t alsa_frame_size;
+    snd_pcm_uframes_t alsa_period;
+    void *io_buf;
+    size_t io_buf_bytes;
+    void *alsa_buf;
+    size_t alsa_buf_bytes;
     // Last cork request from the client. Uncork sets it; a failed reacquire
     // after a Volumio yield leaves it set so the backoff timer can keep trying.
     int want_running;

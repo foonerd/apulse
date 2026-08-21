@@ -809,15 +809,48 @@ stream_wake_output(pa_stream *s)
 }
 
 static void
+stream_free_io_bufs(pa_stream *s)
+{
+    if (!s)
+        return;
+    free(s->io_buf);
+    free(s->alsa_buf);
+    s->io_buf = NULL;
+    s->alsa_buf = NULL;
+    s->io_buf_bytes = 0;
+    s->alsa_buf_bytes = 0;
+}
+
+static int
+stream_alloc_io_bufs(pa_stream *s, snd_pcm_uframes_t period)
+{
+    size_t pulse_fs = pa_frame_size(&s->ss);
+    size_t alsa_fs = s->alsa_frame_size;
+
+    stream_free_io_bufs(s);
+    if (period == 0 || pulse_fs == 0 || alsa_fs == 0)
+        return -1;
+    s->io_buf_bytes = (size_t)period * pulse_fs;
+    s->alsa_buf_bytes = (size_t)period * alsa_fs;
+    s->io_buf = malloc(s->io_buf_bytes);
+    s->alsa_buf = malloc(s->alsa_buf_bytes);
+    if (!s->io_buf || !s->alsa_buf) {
+        stream_free_io_bufs(s);
+        return -1;
+    }
+    return 0;
+}
+
+static void
 data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
                           pa_io_event_flags_t events, void *userdata)
 {
     pa_stream *s = userdata;
     snd_pcm_sframes_t frame_count;
-    size_t frame_size = pa_frame_size(&s->ss);
-    char buf[16 * 1024];
-    const size_t buf_size = pa_find_multiple_of(sizeof(buf), frame_size, 0);
+    size_t pulse_fs = pa_frame_size(&s->ss);
+    size_t alsa_fs = s->alsa_frame_size ? s->alsa_frame_size : pulse_fs;
     int paused = g_atomic_int_get(&s->paused);
+    snd_pcm_uframes_t max_frames;
 
     if (stream_maybe_yield(s))
         return;
@@ -932,15 +965,30 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
         return;
     }
 
+    if (!s->io_buf || pulse_fs == 0 || alsa_fs == 0)
+        return;
+
+    max_frames = s->alsa_period;
+    if (max_frames == 0)
+        max_frames = s->io_buf_bytes / pulse_fs;
+    if (frame_count <= 0) {
+        diag_tick(s);
+        return;
+    }
+    if ((snd_pcm_uframes_t)frame_count > max_frames)
+        frame_count = (snd_pcm_sframes_t)max_frames;
+
     if (events & PA_IO_EVENT_OUTPUT) {
         dstat.wakeups++;
         if (paused) {
             // client stream is corked. Pass silence to ALSA
-            size_t bytecnt = MIN(buf_size, frame_count * frame_size);
             snd_pcm_sframes_t wr;
+            size_t silence_bytes = (size_t)frame_count * alsa_fs;
 
-            memset(buf, 0, bytecnt);
-            wr = snd_pcm_writei(s->ph, buf, bytecnt / frame_size);
+            if (silence_bytes > s->alsa_buf_bytes)
+                silence_bytes = s->alsa_buf_bytes;
+            memset(s->alsa_buf, 0, silence_bytes);
+            wr = snd_pcm_writei(s->ph, s->alsa_buf, frame_count);
             if (wr < 0 && wr != -EAGAIN) {
                 diag_logf("writei failed (%ld), reopening", (long)wr);
                 stream_release_device(s, 1);
@@ -948,24 +996,26 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
                     stream_schedule_acquire(s);
                 return;
             }
-            diag_note_write(wr, bytecnt / frame_size, 1);
+            diag_note_write(wr, frame_count, 1);
         } else {
             size_t writable_size = pa_stream_writable_size(s);
+            size_t pulse_bytes;
+            snd_pcm_uframes_t got;
+            snd_pcm_sframes_t wr;
+            const void *out;
 
             // Ask client for data, but only if we are ready for at least
             // |minreq| bytes.
             if (s->write_cb && writable_size >= s->buffer_attr.minreq)
                 s->write_cb(s, s->buffer_attr.minreq, s->write_cb_userdata);
 
-            size_t bytecnt = MIN(buf_size, frame_count * frame_size);
-            bytecnt = ringbuffer_read(s->rb, buf, bytecnt);
+            pulse_bytes = (size_t)frame_count * pulse_fs;
+            if (pulse_bytes > s->io_buf_bytes)
+                pulse_bytes = s->io_buf_bytes;
+            pulse_bytes = ringbuffer_read(s->rb, s->io_buf, pulse_bytes);
+            got = pulse_bytes / pulse_fs;
 
-            pa_apply_volume_multiplier(buf, bytecnt, s->volume, &s->ss);
-            pa_apply_output_trim(buf, bytecnt, &s->ss);
-
-            snd_pcm_sframes_t wr;
-
-            if (bytecnt == 0) {
+            if (got == 0) {
                 // Nothing to send. Stop asking until the client writes, rather
                 // than inserting silence or spinning on a level-triggered
                 // POLLOUT. The ALSA buffer keeps playing what it already holds.
@@ -973,7 +1023,22 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
                 diag_tick(s);
                 return;
             }
-            wr = snd_pcm_writei(s->ph, buf, bytecnt / frame_size);
+
+            pa_apply_volume_multiplier(s->io_buf, got * pulse_fs, s->volume,
+                                       &s->ss);
+            pa_apply_output_trim(s->io_buf, got * pulse_fs, &s->ss);
+
+            if (pa_format_to_alsa(s->ss.format) == s->alsa_format) {
+                out = s->io_buf;
+            } else if (pa_convert_frames_to_alsa(s->io_buf, s->alsa_buf, got,
+                                                &s->ss, s->alsa_format) == 0) {
+                out = s->alsa_buf;
+            } else {
+                diag_logf("convert failed, dropping period");
+                diag_tick(s);
+                return;
+            }
+            wr = snd_pcm_writei(s->ph, out, got);
             if (wr < 0 && wr != -EAGAIN) {
                 diag_logf("writei failed (%ld), reopening", (long)wr);
                 stream_release_device(s, 1);
@@ -983,7 +1048,7 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
             }
             if (wr > 0)
                 stream_clock_start(s);
-            diag_note_write(wr, bytecnt / frame_size, 0);
+            diag_note_write(wr, (snd_pcm_sframes_t)got, 0);
         }
         diag_tick(s);
     }
@@ -991,26 +1056,26 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
     if (events & PA_IO_EVENT_INPUT) {
         if (paused) {
             // client stream is corked. Read data from ALSA and discard them
-            size_t bytecnt = MIN(buf_size, frame_count * frame_size);
-            snd_pcm_readi(s->ph, buf, bytecnt / frame_size);
+            size_t bytecnt = MIN(s->io_buf_bytes, (size_t)frame_count * pulse_fs);
+            snd_pcm_readi(s->ph, s->io_buf, bytecnt / pulse_fs);
         } else {
             size_t bytecnt = ringbuffer_writable_size(s->rb);
 
             if (bytecnt == 0) {
                 // ringbuffer is full because app doesn't read data fast enough.
                 // Make some room
-                ringbuffer_drop(s->rb, frame_count * frame_size);
+                ringbuffer_drop(s->rb, (size_t)frame_count * pulse_fs);
                 bytecnt = ringbuffer_writable_size(s->rb);
             }
 
-            bytecnt = MIN(bytecnt, frame_count * frame_size);
-            bytecnt = MIN(bytecnt, buf_size);
+            bytecnt = MIN(bytecnt, (size_t)frame_count * pulse_fs);
+            bytecnt = MIN(bytecnt, s->io_buf_bytes);
 
             if (bytecnt > 0) {
-                snd_pcm_readi(s->ph, buf, bytecnt / frame_size);
-                pa_apply_volume_multiplier(buf, bytecnt, s->c->source_volume,
-                                           &s->ss);
-                ringbuffer_write(s->rb, buf, bytecnt);
+                snd_pcm_readi(s->ph, s->io_buf, bytecnt / pulse_fs);
+                pa_apply_volume_multiplier(s->io_buf, bytecnt,
+                                           s->c->source_volume, &s->ss);
+                ringbuffer_write(s->rb, s->io_buf, bytecnt);
             }
 
             size_t readable_size = pa_stream_readable_size(s);
@@ -1031,6 +1096,106 @@ alsa_error_quiet(const char *file, int line, const char *function, int err,
     (void)fmt;
 }
 
+// Playback opens a chain-native format, not the client's. pcm.softvolume
+// already forces S24_3LE, so FLOAT32 never reached the DAC; plug converted
+// every 20 ms write through the whole AAMPP chain. On a Pi 3 that is the
+// lossless-only stutter. Convert once here instead.
+//
+// Capture keeps the client format: there is no reverse converter, and
+// Soloist does not record.
+static snd_pcm_format_t
+stream_pick_alsa_format(snd_pcm_t *pcm, snd_pcm_hw_params_t *hw,
+                        snd_pcm_stream_t dir, pa_sample_format_t pulse_fmt)
+{
+    static const snd_pcm_format_t prefs[] = {
+        SND_PCM_FORMAT_S24_3LE,
+        SND_PCM_FORMAT_S24_LE,
+        SND_PCM_FORMAT_S16_LE,
+    };
+    size_t i;
+
+    if (dir != SND_PCM_STREAM_PLAYBACK)
+        return pa_format_to_alsa(pulse_fmt);
+
+    for (i = 0; i < G_N_ELEMENTS(prefs); i++) {
+        if (snd_pcm_hw_params_test_format(pcm, hw, prefs[i]) == 0)
+            return prefs[i];
+    }
+    return pa_format_to_alsa(pulse_fmt);
+}
+
+// Period is independent of Pulse minreq. minreq stays ~20 ms for the
+// client's write callback; the device gets a hardware-friendly size.
+// 4096 frames is ~93 ms at 44.1 kHz and 4*4096 is Peppyalsa's 16384.
+static int
+stream_pick_period(snd_pcm_t *pcm, snd_pcm_hw_params_t *hw,
+                   snd_pcm_uframes_t *period_out)
+{
+    static const snd_pcm_uframes_t prefs[] = {4096, 2048, 1024, 8192};
+    snd_pcm_hw_params_t *tmp;
+    snd_pcm_uframes_t p;
+    int dir = 0;
+    int err;
+    size_t i;
+
+    for (i = 0; i < G_N_ELEMENTS(prefs); i++) {
+        if (snd_pcm_hw_params_test_period_size(pcm, hw, prefs[i], 0) == 0) {
+            *period_out = prefs[i];
+            return 0;
+        }
+    }
+
+    // Smallest size still in the interval, tried on a copy so a failure
+    // cannot empty the live params (Debian libasound asserts on that).
+    if (snd_pcm_hw_params_malloc(&tmp) < 0)
+        return -1;
+    snd_pcm_hw_params_copy(tmp, hw);
+    p = 0;
+    err = snd_pcm_hw_params_set_period_size_first(pcm, tmp, &p, &dir);
+    snd_pcm_hw_params_free(tmp);
+    if (err < 0 || p == 0)
+        return -1;
+    *period_out = p;
+    return 0;
+}
+
+// Buffer is an integer number of periods, at least four when the device
+// allows it, near the Pulse tlength in time. Tested before set so the
+// interval cannot go empty.
+static int
+stream_pick_buffer(snd_pcm_t *pcm, snd_pcm_hw_params_t *hw,
+                   snd_pcm_uframes_t period, snd_pcm_uframes_t want_frames,
+                   snd_pcm_uframes_t *buffer_out)
+{
+    snd_pcm_uframes_t n;
+    snd_pcm_uframes_t k;
+
+    if (period == 0)
+        return -1;
+    n = want_frames / period;
+    if (n < 4)
+        n = 4;
+
+    if (snd_pcm_hw_params_test_buffer_size(pcm, hw, n * period) == 0) {
+        *buffer_out = n * period;
+        return 0;
+    }
+    if (n != 4 &&
+        snd_pcm_hw_params_test_buffer_size(pcm, hw, 4 * period) == 0) {
+        *buffer_out = 4 * period;
+        return 0;
+    }
+    for (k = 16; k >= 2; k--) {
+        if (k == n || (k == 4 && n != 4))
+            continue;
+        if (snd_pcm_hw_params_test_buffer_size(pcm, hw, k * period) == 0) {
+            *buffer_out = k * period;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static int
 do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
 {
@@ -1039,6 +1204,8 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
     int errcode = 0;
     const char *device_name;
     const char *direction_name;
+    snd_pcm_uframes_t period_size = 0;
+    snd_pcm_uframes_t buffer_size = 0;
 
     switch (stream_direction) {
     default:
@@ -1104,16 +1271,22 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
         goto fatal_error;
     }
 
-    errcode = snd_pcm_hw_params_set_format(s->ph, hw_params,
-                                           pa_format_to_alsa(s->ss.format));
-    if (errcode < 0) {
-        snd_pcm_format_t alsa_format = pa_format_to_alsa(s->ss.format);
-        trace_error(
-            "%s: can't set sample format %d (\"%s\") for %s. Error code %d "
-            "(%s)\n",
-            __func__, alsa_format, snd_pcm_format_name(alsa_format),
-            device_description, errcode, snd_strerror(errcode));
-        goto fatal_error;
+    {
+        snd_pcm_format_t alsa_format =
+            stream_pick_alsa_format(s->ph, hw_params, stream_direction,
+                                    s->ss.format);
+
+        errcode = snd_pcm_hw_params_set_format(s->ph, hw_params, alsa_format);
+        if (errcode < 0) {
+            trace_error(
+                "%s: can't set sample format %d (\"%s\") for %s. Error code %d "
+                "(%s)\n",
+                __func__, alsa_format, snd_pcm_format_name(alsa_format),
+                device_description, errcode, snd_strerror(errcode));
+            goto fatal_error;
+        }
+        s->alsa_format = alsa_format;
+        s->alsa_frame_size = pa_alsa_frame_size(alsa_format, s->ss.channels);
     }
 
     errcode = snd_pcm_hw_params_set_rate_resample(s->ph, hw_params, 1);
@@ -1154,47 +1327,53 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
         goto fatal_error;
     }
 
-    const size_t frame_size = pa_frame_size(&s->ss);
-    snd_pcm_uframes_t requested_period_size =
-        s->buffer_attr.minreq / frame_size;
-    snd_pcm_uframes_t period_size = requested_period_size;
-    dir = 1;  // Prefer larger period sizes, if exact is not possible.
-    errcode = snd_pcm_hw_params_set_period_size_near(s->ph, hw_params,
-                                                     &period_size, &dir);
-    if (errcode < 0) {
-        trace_error(
-            "%s: can't set period size to %d frames for %s. Error code %d "
-            "(%s)\n",
-            __func__, (int)requested_period_size, device_description, errcode,
-            snd_strerror(errcode));
-        goto fatal_error;
+    {
+        const size_t pulse_fs = pa_frame_size(&s->ss);
+        snd_pcm_uframes_t want_frames = 0;
+
+        if (stream_pick_period(s->ph, hw_params, &period_size) < 0) {
+            trace_error("%s: no usable period size for %s\n", __func__,
+                        device_description);
+            goto fatal_error;
+        }
+        errcode = snd_pcm_hw_params_set_period_size(s->ph, hw_params,
+                                                    period_size, 0);
+        if (errcode < 0) {
+            trace_error(
+                "%s: can't set period size to %d frames for %s. Error code %d "
+                "(%s)\n",
+                __func__, (int)period_size, device_description, errcode,
+                snd_strerror(errcode));
+            goto fatal_error;
+        }
+
+        if (pulse_fs > 0)
+            want_frames = s->buffer_attr.tlength / pulse_fs;
+        if (stream_pick_buffer(s->ph, hw_params, period_size, want_frames,
+                               &buffer_size) < 0) {
+            trace_error("%s: no usable buffer size for period %d on %s\n",
+                        __func__, (int)period_size, device_description);
+            goto fatal_error;
+        }
+        errcode =
+            snd_pcm_hw_params_set_buffer_size(s->ph, hw_params, buffer_size);
+        if (errcode < 0) {
+            trace_error(
+                "%s: can't set buffer size to %d frames for %s. Error code %d "
+                "(%s)\n",
+                __func__, (int)buffer_size, device_description, errcode,
+                snd_strerror(errcode));
+            goto fatal_error;
+        }
+
+        s->alsa_period = period_size;
+
+        trace_info_f(
+            "%s: period %d frames, buffer %d frames for %s (pulse minreq was "
+            "%d frames)\n",
+            __func__, (int)period_size, (int)buffer_size, device_description,
+            pulse_fs ? (int)(s->buffer_attr.minreq / pulse_fs) : 0);
     }
-
-    trace_info_f(
-        "%s: requested period size of %d frames, got %d frames for %s\n",
-        __func__, (int)requested_period_size, (int)period_size,
-        device_description);
-
-    // Set up buffer size. Ensure it's at least four times larger than a period
-    // size.
-    snd_pcm_uframes_t requested_buffer_size =
-        s->buffer_attr.tlength / frame_size;
-    snd_pcm_uframes_t buffer_size = MAX(requested_buffer_size, 4 * period_size);
-    errcode =
-        snd_pcm_hw_params_set_buffer_size_near(s->ph, hw_params, &buffer_size);
-    if (errcode < 0) {
-        trace_error(
-            "%s: can't set buffer size to %d frames for %s. Error code %d "
-            "(%s)\n",
-            __func__, (int)buffer_size, device_description, errcode,
-            snd_strerror(errcode));
-        goto fatal_error;
-    }
-
-    trace_info_f(
-        "%s: requested buffer size of %d frames, got %d frames for %s\n",
-        __func__, (int)requested_buffer_size, (int)buffer_size,
-        device_description);
 
     snd_pcm_format_t negotiated_format = SND_PCM_FORMAT_UNKNOWN;
 
@@ -1210,6 +1389,20 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
     // can differ. Without it a format problem is indistinguishable from a
     // timing one.
     snd_pcm_hw_params_get_format(hw_params, &negotiated_format);
+    {
+        int pdir = 0;
+
+        snd_pcm_hw_params_get_period_size(hw_params, &period_size, &pdir);
+        snd_pcm_hw_params_get_buffer_size(hw_params, &buffer_size);
+    }
+    s->alsa_format = negotiated_format;
+    s->alsa_frame_size = pa_alsa_frame_size(negotiated_format, s->ss.channels);
+    s->alsa_period = period_size;
+    if (stream_alloc_io_bufs(s, period_size) < 0) {
+        trace_error("%s: can't allocate period buffers for %s\n", __func__,
+                    device_description);
+        goto fatal_error;
+    }
 
     snd_pcm_hw_params_free(hw_params);
 
@@ -1304,12 +1497,10 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
 fatal_error:
     if (errcode != -EBUSY)
         trace_error(
-            "%s: failed to open ALSA device. Apulse does no resampling or "
-            "format conversion, leaving that task to ALSA plugins. Ensure that "
-            "selected device is capable of playing a particular sample format "
-            "at a particular rate. They have to be supported by either "
-            "hardware directly, or by \"plug\" and \"dmix\" ALSA plugins which "
-            "will perform required conversions on CPU.\n",
+            "%s: failed to open ALSA device. Playback converts to S24 and "
+            "picks a tested period; if this still failed the device rejected "
+            "every candidate. Check that plug:volumio (or the selected "
+            "device) can open at the stream rate.\n",
             __func__);
 
     if (errcode == -EACCES) {
@@ -1578,6 +1769,7 @@ stream_release_device(pa_stream *s, int keep_position)
     snd_pcm_drop(s->ph);
     snd_pcm_close(s->ph);
     s->ph = NULL;
+    stream_free_io_bufs(s);
 
     if (s->rb)
         ringbuffer_drop(s->rb, ringbuffer_readable_size(s->rb));
@@ -2529,6 +2721,7 @@ pa_stream_unref(pa_stream *s)
         ringbuffer_free(s->rb);
         free(s->peek_buffer);
         free(s->write_buffer);
+        stream_free_io_bufs(s);
         free(s->name);
         free(s);
 

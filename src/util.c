@@ -26,6 +26,7 @@
 #include "util.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -284,4 +285,129 @@ pa_apply_output_trim(void *buf, size_t sz, const pa_sample_spec *ss)
     default:
         break;
     }
+}
+
+size_t
+pa_alsa_frame_size(snd_pcm_format_t fmt, unsigned channels)
+{
+    int bits;
+
+    if (channels == 0)
+        return 0;
+    bits = snd_pcm_format_physical_width(fmt);
+    if (bits <= 0)
+        return 0;
+    return ((size_t)bits / 8) * (size_t)channels;
+}
+
+static float
+clampf(float v, float lo, float hi)
+{
+    if (v < lo)
+        return lo;
+    if (v > hi)
+        return hi;
+    return v;
+}
+
+static int32_t
+sample_to_s24(pa_sample_format_t fmt, const char *p)
+{
+    switch (fmt) {
+    case PA_SAMPLE_FLOAT32NE: {
+        float f;
+
+        memcpy(&f, p, sizeof(f));
+        return (int32_t)lrintf(clampf(f, -1.f, 1.f) * 8388607.f);
+    }
+    case PA_SAMPLE_S16NE: {
+        int16_t s;
+
+        memcpy(&s, p, sizeof(s));
+        return (int32_t)s << 8;
+    }
+    default:
+        return 0;
+    }
+}
+
+static void
+pack_s24(snd_pcm_format_t fmt, int32_t v, char *p)
+{
+    if (v > 8388607)
+        v = 8388607;
+    if (v < -8388608)
+        v = -8388608;
+
+    switch (fmt) {
+    case SND_PCM_FORMAT_S24_3LE:
+        p[0] = (char)(v & 0xff);
+        p[1] = (char)((v >> 8) & 0xff);
+        p[2] = (char)((v >> 16) & 0xff);
+        break;
+    case SND_PCM_FORMAT_S24_LE: {
+        int32_t le = v;
+
+        memcpy(p, &le, sizeof(le));
+        break;
+    }
+    case SND_PCM_FORMAT_S16_LE: {
+        int16_t s = (int16_t)(v >> 8);
+
+        memcpy(p, &s, sizeof(s));
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+int
+pa_convert_frames_to_alsa(const void *src, void *dst, size_t frames,
+                          const pa_sample_spec *ss, snd_pcm_format_t fmt)
+{
+    const char *in;
+    char *out;
+    size_t src_width;
+    size_t dst_width;
+    size_t i;
+    unsigned ch;
+    unsigned channels;
+
+    if (!src || !dst || !ss)
+        return -1;
+    if (frames == 0)
+        return 0;
+    if (pa_format_to_alsa(ss->format) == fmt) {
+        size_t n = frames * pa_frame_size(ss);
+
+        memcpy(dst, src, n);
+        return 0;
+    }
+    if (ss->format != PA_SAMPLE_FLOAT32NE && ss->format != PA_SAMPLE_S16NE)
+        return -1;
+    if (fmt != SND_PCM_FORMAT_S24_3LE && fmt != SND_PCM_FORMAT_S24_LE &&
+        fmt != SND_PCM_FORMAT_S16_LE)
+        return -1;
+
+    channels = ss->channels;
+    if (channels == 0)
+        return -1;
+    src_width = pa_sample_size(ss);
+    dst_width = (size_t)snd_pcm_format_physical_width(fmt) / 8;
+    if (src_width == 0 || dst_width == 0)
+        return -1;
+
+    in = src;
+    out = dst;
+    for (i = 0; i < frames; i++) {
+        for (ch = 0; ch < channels; ch++) {
+            int32_t v = sample_to_s24(ss->format, in);
+
+            pack_s24(fmt, v, out);
+            in += src_width;
+            out += dst_width;
+        }
+    }
+    return 0;
 }

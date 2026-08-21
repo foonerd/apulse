@@ -46,3 +46,13 @@ pa_apply_volume_multiplier(void *buf, size_t sz,
 
 void
 pa_apply_output_trim(void *buf, size_t sz, const pa_sample_spec *ss);
+
+size_t
+pa_alsa_frame_size(snd_pcm_format_t fmt, unsigned channels);
+
+// Convert |frames| interleaved frames from the Pulse spec into |fmt|.
+// |dst| must hold frames * pa_alsa_frame_size(fmt, ss->channels) bytes.
+// Returns 0, or -1 if that pair is not implemented.
+int
+pa_convert_frames_to_alsa(const void *src, void *dst, size_t frames,
+                          const pa_sample_spec *ss, snd_pcm_format_t fmt);
