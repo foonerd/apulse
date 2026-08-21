@@ -801,9 +801,6 @@ stream_set_output_enabled(pa_stream *s, int enable)
 static int stream_maybe_yield(pa_stream *s);
 static void stream_release_device(pa_stream *s, int keep_position);
 static void stream_schedule_acquire(pa_stream *s);
-// Defined with the device ownership block below; the xrun path above it needs
-// the same clock hold that a yield uses.
-static void stream_clock_hold_at(pa_stream *s, pa_usec_t pos);
 
 static void
 stream_wake_output(pa_stream *s)
@@ -829,12 +826,16 @@ stream_alloc_io_bufs(pa_stream *s, snd_pcm_uframes_t period)
 {
     size_t pulse_fs = pa_frame_size(&s->ss);
     size_t alsa_fs = s->alsa_frame_size;
+    snd_pcm_uframes_t chunk;
 
     stream_free_io_bufs(s);
     if (period == 0 || pulse_fs == 0 || alsa_fs == 0)
         return -1;
-    s->io_buf_bytes = (size_t)period * pulse_fs;
-    s->alsa_buf_bytes = (size_t)period * alsa_fs;
+    // Four periods so one wakeup can refill the switcher, not just replace
+    // the period it just consumed.
+    chunk = period * 4;
+    s->io_buf_bytes = (size_t)chunk * pulse_fs;
+    s->alsa_buf_bytes = (size_t)chunk * alsa_fs;
     s->io_buf = malloc(s->io_buf_bytes);
     s->alsa_buf = malloc(s->alsa_buf_bytes);
     if (!s->io_buf || !s->alsa_buf) {
@@ -870,180 +871,26 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
 #endif
 
         if (frame_count < 0) {
-            if (frame_count == -EBADFD) {
-                // stream was closed
+            if (frame_count == -EBADFD)
+                return;
+            if (frame_count == -EAGAIN) {
+                diag_tick(s);
                 return;
             }
 
-            int cnt = 0, ret;
-
+            // volumioswitch: snd_pcm_avail(softvolume) < 0 is "failed its
+            // update check" and becomes -EPIPE here. snd_pcm_recover prepares
+            // the switcher handle and leaves the dead target in place, so
+            // the next advance logs the same line and we write into a local
+            // buffer that never reaches the DAC. close + open is the only
+            // thing that creates a new target. keep_position holds the
+            // playhead across that close.
             dstat.xrun++;
-            do {
-                cnt++;
-                ret = snd_pcm_recover(s->ph, frame_count, 1);
-            } while (ret == -1 && errno == EINTR && cnt < 5);
-
-            switch (snd_pcm_state(s->ph)) {
-            case SND_PCM_STATE_OPEN:
-                // Highly unlikely device will be here in this state. But if it
-                // is, there is nothing can be done.
-                trace_error(
-                    "Stream '%s' of context '%s' have its associated PCM "
-                    "device in SND_PCM_STATE_OPEN state. Reconfiguration is "
-                    "required, but is not possible at the moment. Giving up.",
-                    s->name ? s->name : "", s->c->name ? s->c->name : "");
-                break;
-
-            case SND_PCM_STATE_SETUP:
-                // There is configuration, but device is not prepared and not
-                // started.
-                snd_pcm_prepare(s->ph);
-                snd_pcm_start(s->ph);
-                break;
-
-            case SND_PCM_STATE_PREPARED:
-                // Device prepared, but not started.
-                snd_pcm_start(s->ph);
-                break;
-
-            case SND_PCM_STATE_RUNNING:
-                // That's the expected state.
-                break;
-
-            case SND_PCM_STATE_XRUN:
-                trace_error(
-                    "Stream '%s' of context '%s' have its associated device in "
-                    "SND_PCM_STATE_XRUN state even after xrun recovery.",
-                    s->name ? s->name : "", s->c->name ? s->c->name : "");
-                break;
-
-            case SND_PCM_STATE_DRAINING:
-                trace_error(
-                    "Stream '%s' of context '%s' have its associated device in "
-                    "SND_PCM_STATE_DRAINING state, which is highly unusual.",
-                    s->name ? s->name : "", s->c->name ? s->c->name : "");
-                break;
-
-            case SND_PCM_STATE_PAUSED:
-                // Resume from paused state.
-                snd_pcm_pause(s->ph, 0);
-                break;
-
-            case SND_PCM_STATE_SUSPENDED:
-                // Resume from suspended state.
-                snd_pcm_resume(s->ph);
-                break;
-
-            case SND_PCM_STATE_DISCONNECTED:
-                trace_error(
-                    "Stream '%s' of context '%s' have its associated device in "
-                    "SND_PCM_STATE_DISCONNECTED state. Giving up.",
-                    s->name ? s->name : "", s->c->name ? s->c->name : "");
-                break;
-            default:
-                // avoid compiler warnings of unhandled (library-private) enum values
-                break;
-            }
-
-#if HAVE_SND_PCM_AVAIL
-            frame_count = snd_pcm_avail(s->ph);
-#else
-            snd_pcm_hwsync(s->ph);
-            frame_count = snd_pcm_avail_update(s->ph);
-#endif
-
-            if (frame_count < 0) {
-                // volumioswitch can return EPIPE from a stale target while the
-                // switcher handle stays open. recover/prepare does not reopen
-                // that target; only close + snd_pcm_open does.
-                diag_logf("pcm unrecovered (%ld), reopening",
-                          (long)frame_count);
-                stream_release_device(s, 1);
-                if (s->want_running)
-                    stream_schedule_acquire(s);
-                return;
-            }
-
-            // Recovery succeeded, so account for the audio the xrun destroyed.
-            //
-            // Without this the stream deadlocks and never returns. read_index
-            // comes only from stream_hw_time, which reads hw_ptr from
-            // /proc/asound and requires the PCM to be RUNNING
-            // (read_hw_pcm_snap: "if (!status_is_running(status_path)) return
-            // -1"). An xrun is precisely not running, so the read fails,
-            // clock_have_path is cleared, the rescan fails on every candidate
-            // for the same reason, and the held position is returned. That is
-            // silent: the "no hardware hw_ptr found" line is one-shot via
-            // clock_logged and has already been spent at connect.
-            //
-            // From there it sustains itself. read_index stops while
-            // write_index continues, so fill reaches tlength, writable_size
-            // (tlength - fill) reaches zero and the client stops writing.
-            // With nothing to write, volumioswitch never reaches its
-            // snd_pcm_start on the target, the target never runs, and the
-            // hardware PCM never returns to RUNNING to unfreeze the clock.
-            //
-            // Observed: r frozen at 1423672 while w ran on to 1531904, fill
-            // 108232 against a tlength of 105840, wr=0 and cbytes=0 for the
-            // remaining twenty seconds, with avail sitting at the full 16384.
-            //
-            // Everything handed to ALSA at that point is gone, which is what
-            // an xrun means, so read_index is exactly write_index less what is
-            // still in our own ring and has yet to be offered. That drains
-            // fill, writable_size opens, the client writes, the target starts,
-            // and the clock re-anchors on its own.
-            {
-                size_t queued = s->rb ? ringbuffer_readable_size(s->rb) : 0;
-                int64_t played = s->timing_info.write_index - (int64_t)queued;
-
-                if (played < s->timing_info.read_index)
-                    played = s->timing_info.read_index;
-                if (played < 0)
-                    played = 0;
-
-                diag_logf("xrun recovered: read_index %lld -> %lld "
-                          "(w=%lld queued=%zu)",
-                          (long long)s->timing_info.read_index,
-                          (long long)played,
-                          (long long)s->timing_info.write_index, queued);
-
-                s->timing_info.read_index = played;
-
-                // Re-anchor the clock to the position we just declared, the
-                // same way a cork resume does.
-                //
-                // stream_clock_reset alone was wrong and made this worse. It
-                // zeroes clock_frozen_usec and clock_origin_hw, so the next
-                // read restarts the position near zero, and the monotonic
-                // guard in stream_hw_time ("if (played < clock_last_played)")
-                // together with the one in stream_update_timing then pins
-                // read_index at the jumped value until the hardware clock
-                // climbs past it, which does not happen within a track.
-                //
-                // Observed with reset alone: read_index advanced only at these
-                // lines, in exact steps of 106496 bytes - one tlength - and
-                // never between them. The stream progressed solely by
-                // xrunning. Soloist saw a frozen position, throttled, starved
-                // ALSA, and xrun once or twice a second for as long as it
-                // played.
-                //
-                // clock_frozen_usec is the existing mechanism for exactly this
-                // (see stream_hw_time: the origin is placed so the position
-                // continues from where it froze instead of restarting at
-                // zero). Set it to the time equivalent of the new read_index,
-                // and stream_clock_start on the next successful write picks it
-                // up without any further special case.
-                //
-                // stream_clock_hold_at is that operation, factored out of
-                // stream_clock_hold so the yield path and this one cannot
-                // drift apart. It does not touch the indices, which is what
-                // this case needs: the ring still holds bytes the client wrote
-                // and ALSA never saw, so write_index stays and fill becomes
-                // exactly that.
-                s->timing_info.since_underrun = 0;
-                stream_clock_hold_at(
-                    s, pa_bytes_to_usec((uint64_t)played, &s->ss));
-            }
+            diag_logf("pcm avail %ld, reopening", (long)frame_count);
+            stream_release_device(s, 1);
+            if (s->want_running)
+                stream_schedule_acquire(s);
+            return;
         }
     } else {
         return;
@@ -1052,9 +899,9 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
     if (!s->io_buf || pulse_fs == 0 || alsa_fs == 0)
         return;
 
-    max_frames = s->alsa_period;
-    if (max_frames == 0)
-        max_frames = s->io_buf_bytes / pulse_fs;
+    max_frames = s->io_buf_bytes / pulse_fs;
+    if (max_frames == 0 && s->alsa_period)
+        max_frames = s->alsa_period;
     if (frame_count <= 0) {
         diag_tick(s);
         return;
@@ -1180,49 +1027,56 @@ alsa_error_quiet(const char *file, int line, const char *function, int err,
     (void)fmt;
 }
 
-// Playback opens a chain-native format, not the client's. pcm.softvolume
-// already forces S24_3LE, so FLOAT32 never reached the DAC; plug converted
-// every 20 ms write through the whole AAMPP chain. On a Pi 3 that is the
-// lossless-only stutter. Convert once here instead.
-//
-// Capture keeps the client format: there is no reverse converter, and
-// Soloist does not record.
+// Open as the client's format. plug:volumio is volumioswitch, an ioplug.
+// Forcing S24_3LE here put a 3-byte sample through that ioplug; avail on
+// the target then went negative and the journal printed "failed its
+// update check" on every advance. S24_3LE belongs at pcm.softvolume,
+// after the switcher. Capture has no converter.
 static snd_pcm_format_t
 stream_pick_alsa_format(snd_pcm_t *pcm, snd_pcm_hw_params_t *hw,
                         snd_pcm_stream_t dir, pa_sample_format_t pulse_fmt)
 {
-    static const snd_pcm_format_t prefs[] = {
-        SND_PCM_FORMAT_S24_3LE,
-        SND_PCM_FORMAT_S24_LE,
+    snd_pcm_format_t fmt = pa_format_to_alsa(pulse_fmt);
+    static const snd_pcm_format_t fallbacks[] = {
         SND_PCM_FORMAT_S16_LE,
+        SND_PCM_FORMAT_S24_LE,
+        SND_PCM_FORMAT_FLOAT_LE,
     };
     size_t i;
 
-    if (dir != SND_PCM_STREAM_PLAYBACK)
-        return pa_format_to_alsa(pulse_fmt);
-
-    for (i = 0; i < G_N_ELEMENTS(prefs); i++) {
-        if (snd_pcm_hw_params_test_format(pcm, hw, prefs[i]) == 0)
-            return prefs[i];
+    (void)dir;
+    if (fmt != SND_PCM_FORMAT_UNKNOWN &&
+        snd_pcm_hw_params_test_format(pcm, hw, fmt) == 0)
+        return fmt;
+    for (i = 0; i < G_N_ELEMENTS(fallbacks); i++) {
+        if (snd_pcm_hw_params_test_format(pcm, hw, fallbacks[i]) == 0)
+            return fallbacks[i];
     }
-    return pa_format_to_alsa(pulse_fmt);
+    return fmt;
 }
 
-// Period is independent of Pulse minreq. minreq stays ~20 ms for the
-// client's write callback; the device gets a hardware-friendly size.
-// 4096 frames is ~93 ms at 44.1 kHz and 4*4096 is Peppyalsa's 16384.
+// Prefer the Pulse minreq (historically ~20 ms / ~882 frames). 4096 was
+// first in this list and plug:volumio accepts anything, so every device
+// got a 93 ms period and one-period writes that starved the switcher.
 static int
 stream_pick_period(snd_pcm_t *pcm, snd_pcm_hw_params_t *hw,
-                   snd_pcm_uframes_t *period_out)
+                   snd_pcm_uframes_t want, snd_pcm_uframes_t *period_out)
 {
-    static const snd_pcm_uframes_t prefs[] = {4096, 2048, 1024, 8192};
+    snd_pcm_uframes_t prefs[6];
+    size_t n = 0;
     snd_pcm_hw_params_t *tmp;
     snd_pcm_uframes_t p;
     int dir = 0;
     int err;
     size_t i;
 
-    for (i = 0; i < G_N_ELEMENTS(prefs); i++) {
+    if (want > 0)
+        prefs[n++] = want;
+    prefs[n++] = 1024;
+    prefs[n++] = 2048;
+    prefs[n++] = 4096;
+
+    for (i = 0; i < n; i++) {
         if (snd_pcm_hw_params_test_period_size(pcm, hw, prefs[i], 0) == 0) {
             *period_out = prefs[i];
             return 0;
@@ -1413,9 +1267,13 @@ do_connect_pcm(pa_stream *s, snd_pcm_stream_t stream_direction)
 
     {
         const size_t pulse_fs = pa_frame_size(&s->ss);
+        snd_pcm_uframes_t want_period = 0;
         snd_pcm_uframes_t want_frames = 0;
 
-        if (stream_pick_period(s->ph, hw_params, &period_size) < 0) {
+        if (pulse_fs > 0 && s->buffer_attr.minreq > 0)
+            want_period = s->buffer_attr.minreq / pulse_fs;
+        if (stream_pick_period(s->ph, hw_params, want_period,
+                               &period_size) < 0) {
             trace_error("%s: no usable period size for %s\n", __func__,
                         device_description);
             goto fatal_error;
