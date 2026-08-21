@@ -960,6 +960,63 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
                     stream_schedule_acquire(s);
                 return;
             }
+
+            // Recovery succeeded, so account for the audio the xrun destroyed.
+            //
+            // Without this the stream deadlocks and never returns. read_index
+            // comes only from stream_hw_time, which reads hw_ptr from
+            // /proc/asound and requires the PCM to be RUNNING
+            // (read_hw_pcm_snap: "if (!status_is_running(status_path)) return
+            // -1"). An xrun is precisely not running, so the read fails,
+            // clock_have_path is cleared, the rescan fails on every candidate
+            // for the same reason, and the held position is returned. That is
+            // silent: the "no hardware hw_ptr found" line is one-shot via
+            // clock_logged and has already been spent at connect.
+            //
+            // From there it sustains itself. read_index stops while
+            // write_index continues, so fill reaches tlength, writable_size
+            // (tlength - fill) reaches zero and the client stops writing.
+            // With nothing to write, volumioswitch never reaches its
+            // snd_pcm_start on the target, the target never runs, and the
+            // hardware PCM never returns to RUNNING to unfreeze the clock.
+            //
+            // Observed: r frozen at 1423672 while w ran on to 1531904, fill
+            // 108232 against a tlength of 105840, wr=0 and cbytes=0 for the
+            // remaining twenty seconds, with avail sitting at the full 16384.
+            //
+            // Everything handed to ALSA at that point is gone, which is what
+            // an xrun means, so read_index is exactly write_index less what is
+            // still in our own ring and has yet to be offered. That drains
+            // fill, writable_size opens, the client writes, the target starts,
+            // and the clock re-anchors on its own.
+            {
+                size_t queued = s->rb ? ringbuffer_readable_size(s->rb) : 0;
+                int64_t played = s->timing_info.write_index - (int64_t)queued;
+
+                if (played < s->timing_info.read_index)
+                    played = s->timing_info.read_index;
+                if (played < 0)
+                    played = 0;
+
+                diag_logf("xrun recovered: read_index %lld -> %lld "
+                          "(w=%lld queued=%zu)",
+                          (long long)s->timing_info.read_index,
+                          (long long)played,
+                          (long long)s->timing_info.write_index, queued);
+
+                s->timing_info.read_index = played;
+
+                // The held position is stale by definition now, and the path
+                // it was read from was dropped when the snap failed. Reset so
+                // the next read re-acquires and re-anchors rather than
+                // interpolating from a position that predates the xrun.
+                //
+                // Reset only. The clock is started where audio actually moves
+                // ("if (wr > 0) stream_clock_start" in the write path below,
+                // and on uncork); starting it here would run it over a device
+                // that has been prepared but not yet fed.
+                stream_clock_reset(s);
+            }
         }
     } else {
         return;
