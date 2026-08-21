@@ -801,6 +801,9 @@ stream_set_output_enabled(pa_stream *s, int enable)
 static int stream_maybe_yield(pa_stream *s);
 static void stream_release_device(pa_stream *s, int keep_position);
 static void stream_schedule_acquire(pa_stream *s);
+// Defined with the device ownership block below; the xrun path above it needs
+// the same clock hold that a yield uses.
+static void stream_clock_hold_at(pa_stream *s, pa_usec_t pos);
 
 static void
 stream_wake_output(pa_stream *s)
@@ -1006,16 +1009,40 @@ data_available_for_stream(pa_mainloop_api *a, pa_io_event *ioe, int fd,
 
                 s->timing_info.read_index = played;
 
-                // The held position is stale by definition now, and the path
-                // it was read from was dropped when the snap failed. Reset so
-                // the next read re-acquires and re-anchors rather than
-                // interpolating from a position that predates the xrun.
+                // Re-anchor the clock to the position we just declared, the
+                // same way a cork resume does.
                 //
-                // Reset only. The clock is started where audio actually moves
-                // ("if (wr > 0) stream_clock_start" in the write path below,
-                // and on uncork); starting it here would run it over a device
-                // that has been prepared but not yet fed.
-                stream_clock_reset(s);
+                // stream_clock_reset alone was wrong and made this worse. It
+                // zeroes clock_frozen_usec and clock_origin_hw, so the next
+                // read restarts the position near zero, and the monotonic
+                // guard in stream_hw_time ("if (played < clock_last_played)")
+                // together with the one in stream_update_timing then pins
+                // read_index at the jumped value until the hardware clock
+                // climbs past it, which does not happen within a track.
+                //
+                // Observed with reset alone: read_index advanced only at these
+                // lines, in exact steps of 106496 bytes - one tlength - and
+                // never between them. The stream progressed solely by
+                // xrunning. Soloist saw a frozen position, throttled, starved
+                // ALSA, and xrun once or twice a second for as long as it
+                // played.
+                //
+                // clock_frozen_usec is the existing mechanism for exactly this
+                // (see stream_hw_time: the origin is placed so the position
+                // continues from where it froze instead of restarting at
+                // zero). Set it to the time equivalent of the new read_index,
+                // and stream_clock_start on the next successful write picks it
+                // up without any further special case.
+                //
+                // stream_clock_hold_at is that operation, factored out of
+                // stream_clock_hold so the yield path and this one cannot
+                // drift apart. It does not touch the indices, which is what
+                // this case needs: the ring still holds bytes the client wrote
+                // and ALSA never saw, so write_index stays and fill becomes
+                // exactly that.
+                s->timing_info.since_underrun = 0;
+                stream_clock_hold_at(
+                    s, pa_bytes_to_usec((uint64_t)played, &s->ss));
             }
         }
     } else {
@@ -1772,16 +1799,24 @@ stream_after_ms(pa_stream *s, unsigned ms, pa_time_event_cb_t cb)
     return api->time_new(api, &tv, cb, s);
 }
 
-// Close the PCM but keep the playhead. The next open is a new hw_ptr
-// generation; origin is rebuilt from the frozen usec on the first RUNNING
-// sample so Soloist does not jump to 0:00 after a Volumio yield.
+// End the hw_ptr generation but keep the playhead at |pos|.
+//
+// The next open, prepare or recover starts a new hardware pointer from zero, so
+// origin, path and model all have to go. What must not go is the position: it
+// is rebuilt from clock_frozen_usec on the first RUNNING sample (see the resume
+// branch in stream_hw_time), which is why this is not stream_clock_reset.
+//
+// stream_clock_reset means the audio is gone and the playhead restarts at zero,
+// and every one of its four callers zeroes both indices alongside it. Using it
+// where the position must survive leaves clock_frozen_usec at 0, so the resume
+// branch does not fire, played counts up from zero again, and the monotonic
+// hold in stream_update_timing pins read_index for the rest of the track.
+//
+// Indices are the caller's business. A yield discards the ring and restarts
+// both from here; an xrun keeps what the ring still holds.
 static void
-stream_clock_hold(pa_stream *s)
+stream_clock_hold_at(pa_stream *s, pa_usec_t pos)
 {
-    pa_usec_t held = s->clock_frozen_usec ? s->clock_frozen_usec
-                                          : s->clock_last_played;
-    int64_t bytes;
-
     s->clock_origin_hw = 0;
     s->clock_last_hw = -1;
     s->clock_have_origin = 0;
@@ -1793,8 +1828,21 @@ stream_clock_hold(pa_stream *s)
     s->clock_model_rate = 0.0;
     s->clock_model_valid = 0;
     s->clock_running = 0;
-    s->clock_frozen_usec = held;
-    s->clock_last_played = held;
+    s->clock_frozen_usec = pos;
+    s->clock_last_played = pos;
+}
+
+// Close the PCM but keep the playhead. The next open is a new hw_ptr
+// generation; origin is rebuilt from the frozen usec on the first RUNNING
+// sample so Soloist does not jump to 0:00 after a Volumio yield.
+static void
+stream_clock_hold(pa_stream *s)
+{
+    pa_usec_t held = s->clock_frozen_usec ? s->clock_frozen_usec
+                                          : s->clock_last_played;
+    int64_t bytes;
+
+    stream_clock_hold_at(s, held);
 
     bytes = (int64_t)pa_usec_to_bytes(held, &s->ss);
     if (bytes < 0)
